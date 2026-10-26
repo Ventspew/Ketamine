@@ -1,56 +1,40 @@
-# Device Management — on-device test (iPhone 15 Pro / iOS 27 beta 3)
+# Device Management — on-device tests (iOS 27 beta 3)
 
-## Build
+## Build / IPA
 
-```bash
-cd ~/Projects/Ketamine
-# Generate Xcode project if needed
-xcodegen generate   # requires: brew install xcodegen
-open Ketamine.xcodeproj
-```
+GitHub Actions on `Ventspew/Ketamine` builds `Ketamine-unsigned.ipa` (artifact `Ketamine-unsigned-ipa`).
 
-1. Select your team / signing for `uk.nouvborne.ketamine` (or change the bundle id).
-2. Destination: your iPhone 15 Pro.
-3. Run (⌘R). Keep **Developer Mode** on if Xcode asks.
+Or: Actions → **Build unsigned IPA** → Run workflow.
 
-No new entitlements were added. Diagnostics use the same BadQuery path as Eligibility.
+## Test A — Write capability (diagnostics)
 
-## Test procedure
+1. Install unsigned IPA (TrollStore / Sideloadly / etc.).
+2. **Settings → Device Management → Run diagnostics**.
+3. Confirm:
+   - Directory write (probe file) = **yes**
+   - CloudConfiguration write (identical rewrite) = **yes**
+4. If either is **no**, Enable stays locked — paste the error strings.
 
-1. Open **Ketamine** → **Settings** → **Device Management**.
-2. Tap **Run diagnostics**.
-3. Record every row (screenshot is fine), especially:
-   - BadQuery available
-   - configurationprofiles dir (yes/no + error text)
-   - CloudConfiguration exists / readable
-   - IsSupervised (plist claim)
-   - MC isSupervised (independent)
-   - Independently verified
-4. **Optional second channel:** Mareades MDM admin → device → **Info** → note `IsSupervised`.
-5. Do **not** expect Enable Supervision to work yet — those buttons are locked on purpose.
+## Test B — Enable Supervision (experimental)
 
-## How to interpret
+1. Only if write gate = yes.
+2. Tap **Enable Supervision** → confirm.
+3. Read the result alert:
+   - **Success** only if **MC isSupervised = true**.
+   - **Incomplete** if plist true but MC still false → **not** DelayOTA-ready.
+4. Tap **Verify Supervision Status** again after a respring (optional) and note MC again.
+5. Optional: Mareades MDM → Info → IsSupervised as a third channel.
 
-| Result | Meaning |
-|--------|---------|
-| configurationprofiles **no** + BadQuery `-3` / outside sandbox | Access gate failed — Enable Supervision cannot be built on this exploit path for this build. |
-| configurationprofiles **yes**, cloud config missing | Access OK; device never had CloudConfigurationDetails — Enable would *create* a plist (still experimental). |
-| plist `IsSupervised` true/false | **Claim only** — not DelayOTA proof. |
-| MC isSupervised true/false | Stronger signal if probe supported; still confirm with MDM Info if possible. |
-| Independently verified **no** | Do not treat the device as DelayOTA-ready. |
+## Test C — Restore
 
-## Verified vs experimental after this build
+1. **Restore Original Configuration** (needs backup from Enable).
+2. Re-run diagnostics — plist/MC should match pre-Enable (typically unsupervised).
 
-**Verified in code (this change):**
-- Read-only UI + BadQuery directory probe for `systemgroup.com.apple.configurationprofiles`
-- Optional read of `CloudConfigurationDetails.plist`
-- Optional `MCProfileConnection.isSupervised` runtime probe
-- Enable / Restore **disabled** (no writes)
+## Test D — DelayOTA (only if MC = true)
 
-**Still experimental / unproven until you run on device:**
-- Whether BadQuery actually grants that SystemGroup on *your* 27.0b3
-- Whether a future write to `IsSupervised` would be honored by softwareupdated / DelayOTA
+1. Ensure Mareades (or other) MDM profile with `forceDelayedSoftwareUpdates` / 90-day delay is installed.
+2. Check Settings → General → Software Update:
+   - Newer builds (e.g. 27.2) delayed/hidden?
+3. Report: **verified / unsupported / unknown**.
 
-## DelayOTA reminder
-
-Even with real supervision you still need the Mareades (or other) restriction profile with update delay, and Apple must still offer 27.0.1 to the device. Diagnostics do not change update availability.
+DelayOTA also requires Apple still serving 27.0.1 — supervision does not extend signing.
