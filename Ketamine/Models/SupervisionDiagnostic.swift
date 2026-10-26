@@ -1,18 +1,14 @@
 import Foundation
 import ObjectiveC
 
-/// Read-only probes for BadQuery reachability into the configurationprofiles
-/// SystemGroup and the CloudConfigurationDetails.plist `IsSupervised` flag.
+/// Diagnostics + experimental CloudConfigurationDetails supervision toggle.
 ///
-/// Does **not** write supervision state. A plist `IsSupervised == true` is reported
-/// as a configuration claim only — ManagedConfiguration / DelayOTA recognition
-/// requires an independent check (e.g. MDM DeviceInformation).
+/// Success for Enable requires ManagedConfiguration `isSupervised == true`
+/// after the write — a plist-only change is reported as incomplete.
 @MainActor
 final class SupervisionDiagnostic: ObservableObject {
 
     static let shared = SupervisionDiagnostic()
-
-    // MARK: - Paths (same SystemGroup tree EligibilityManager uses on iOS 27)
 
     static let configurationProfilesDir =
         "/var/containers/Shared/SystemGroup/systemgroup.com.apple.configurationprofiles"
@@ -22,7 +18,9 @@ final class SupervisionDiagnostic: ObservableObject {
         configurationProfilesDir + "/" + cloudConfigurationRelativePath
     }
 
-    // MARK: - Published results
+    static let organizationName = "Ketamine Experimental"
+
+    // MARK: - Result
 
     struct Result: Equatable {
         var ranAt: Date?
@@ -32,63 +30,79 @@ final class SupervisionDiagnostic: ObservableObject {
         var configProfilesDirReachable: Bool = false
         var configProfilesDirError: String?
 
+        /// Non-destructive: write+delete a probe file under the SystemGroup dir.
+        var dirWriteAllowed: Bool = false
+        var dirWriteError: String?
+
         var cloudConfigExists: Bool = false
         var cloudConfigReadable: Bool = false
         var cloudConfigError: String?
+
+        /// Open CloudConfigurationDetails for write without changing contents
+        /// (atomic rewrite of identical bytes), then verify.
+        var cloudConfigWriteAllowed: Bool = false
+        var cloudConfigWriteError: String?
+
         var isSupervisedPlistClaim: Bool?
         var organizationName: String?
         var cloudConfigKeys: [String] = []
 
-        /// Best-effort ManagedConfiguration private API probe (read-only).
         var mcProbeAttempted: Bool = false
         var mcProbeSupported: Bool = false
         var mcIsSupervised: Bool?
         var mcProbeError: String?
 
-        /// True only when MC probe returned a definite bool (not merely plist).
+        var lastActionNote: String?
+
         var systemRecognizedIndependentlyVerified: Bool {
             mcProbeSupported && mcIsSupervised != nil
         }
 
+        var writeGatePassed: Bool {
+            badQueryAvailable && configProfilesDirReachable && dirWriteAllowed && cloudConfigWriteAllowed
+        }
+
         var summaryLine: String {
-            if !badQueryAvailable { return "BadQuery symbols unavailable — diagnostics incomplete." }
-            if osMajor < 27 {
-                return "SystemGroup grant for this probe is documented for iOS 27+; this OS may return -3."
-            }
+            if !badQueryAvailable { return "BadQuery unavailable." }
             if !configProfilesDirReachable {
-                return "configurationprofiles SystemGroup not reachable (\(configProfilesDirError ?? "unknown"))."
+                return "configurationprofiles unreachable (\(configProfilesDirError ?? "?"))"
             }
-            if cloudConfigReadable {
-                let claim = isSupervisedPlistClaim.map { $0 ? "true" : "false" } ?? "missing"
-                let mc: String
-                if let v = mcIsSupervised {
-                    mc = v ? "MC=true" : "MC=false"
-                } else if mcProbeAttempted {
-                    mc = "MC unverified"
-                } else {
-                    mc = "MC not probed"
-                }
-                return "Cloud config readable — IsSupervised plist=\(claim); \(mc)."
-            }
-            if cloudConfigExists {
-                return "CloudConfigurationDetails.plist exists but could not be read (\(cloudConfigError ?? "unknown"))."
-            }
-            return "configurationprofiles reachable; CloudConfigurationDetails.plist not found (device may never have been cloud-configured)."
+            let write = writeGatePassed ? "write OK" : "write blocked"
+            let claim = isSupervisedPlistClaim.map { $0 ? "plist=true" : "plist=false" } ?? "plist=?"
+            let mc = mcIsSupervised.map { $0 ? "MC=true" : "MC=false" } ?? "MC=?"
+            return "\(write); \(claim); \(mc)"
         }
     }
 
-    @Published private(set) var isBusy = false
-    @Published private(set) var last: Result = Result()
-    @Published var lastError: String?
-
-    /// When true, Enable/Restore UI may be shown — still disabled until access + policy gates pass.
-    var accessGatePassed: Bool {
-        last.configProfilesDirReachable && last.badQueryAvailable
+    enum ActionOutcome: Equatable {
+        case success(String)
+        case incomplete(String)
+        case failed(String)
     }
 
-    private init() {}
+    @Published private(set) var isBusy = false
+    @Published private(set) var last = Result()
+    @Published var lastError: String?
+    @Published private(set) var lastAction: ActionOutcome?
+    @Published private(set) var hasLocalBackup = false
 
-    // MARK: - Run
+    var accessGatePassed: Bool { last.configProfilesDirReachable && last.badQueryAvailable }
+    var enableGatePassed: Bool { last.writeGatePassed && last.cloudConfigReadable }
+
+    private var backupURL: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("cloud_configuration_backup.plist")
+    }
+
+    private init() {
+        refreshBackupFlag()
+    }
+
+    private func refreshBackupFlag() {
+        hasLocalBackup = FileManager.default.fileExists(atPath: backupURL.path)
+    }
+
+    // MARK: - Diagnostics
 
     func run() async {
         guard !isBusy else { return }
@@ -100,8 +114,9 @@ final class SupervisionDiagnostic: ObservableObject {
         result.ranAt = Date()
         result.osMajor = ProcessInfo.processInfo.operatingSystemVersion.majorVersion
         result.badQueryAvailable = BadQuery.isAvailable
+        result.lastActionNote = lastAction.map { "\($0)" }
 
-        // 1) Directory consume (EligibilityManager pattern — directory, not leaf)
+        // 1) Directory reachability
         do {
             let handle = try BadQuery.consume(path: Self.configurationProfilesDir, create: true)
             defer { handle.release() }
@@ -110,11 +125,11 @@ final class SupervisionDiagnostic: ObservableObject {
                 atPath: Self.configurationProfilesDir,
                 isDirectory: &isDir
             )
-            result.configProfilesDirReachable = exists
+            result.configProfilesDirReachable = exists && isDir.boolValue
             if !exists {
-                result.configProfilesDirError = "Extension consumed but path does not exist on disk."
+                result.configProfilesDirError = "Extension consumed but path missing."
             } else if !isDir.boolValue {
-                result.configProfilesDirError = "Path exists but is not a directory."
+                result.configProfilesDirError = "Path is not a directory."
                 result.configProfilesDirReachable = false
             }
         } catch {
@@ -122,7 +137,24 @@ final class SupervisionDiagnostic: ObservableObject {
             result.configProfilesDirError = describe(error)
         }
 
-        // 2) Read CloudConfigurationDetails.plist (still holding dir semantics)
+        // 2) Non-destructive directory write probe (EligibilityManager .bq_probe pattern)
+        if result.configProfilesDirReachable {
+            do {
+                let handle = try BadQuery.consume(path: Self.configurationProfilesDir, create: true)
+                defer { handle.release() }
+                let dir = URL(fileURLWithPath: Self.configurationProfilesDir, isDirectory: true)
+                let probe = dir.appendingPathComponent(".km_write_probe")
+                try? FileManager.default.removeItem(at: probe)
+                try Data([0x4B, 0x4D]).write(to: probe, options: .withoutOverwriting)
+                try FileManager.default.removeItem(at: probe)
+                result.dirWriteAllowed = true
+            } catch {
+                result.dirWriteAllowed = false
+                result.dirWriteError = describe(error)
+            }
+        }
+
+        // 3) Read cloud config + identical-bytes write probe (no semantic change)
         if result.configProfilesDirReachable {
             do {
                 let handle = try BadQuery.consume(path: Self.configurationProfilesDir, create: true)
@@ -135,21 +167,30 @@ final class SupervisionDiagnostic: ObservableObject {
                     guard let parsed = try PropertyListSerialization.propertyList(
                         from: data, options: [], format: nil
                     ) as? [String: Any] else {
-                        result.cloudConfigError = "Plist parsed but root is not a dictionary."
+                        result.cloudConfigError = "Root is not a dictionary."
                         throw CocoaError(.propertyListReadCorrupt)
                     }
                     result.cloudConfigReadable = true
                     result.cloudConfigKeys = parsed.keys.sorted()
-                    if let supervised = parsed["IsSupervised"] as? Bool {
-                        result.isSupervisedPlistClaim = supervised
-                    } else if let num = parsed["IsSupervised"] as? NSNumber {
-                        result.isSupervisedPlistClaim = num.boolValue
-                    } else {
-                        result.isSupervisedPlistClaim = nil
-                    }
+                    result.isSupervisedPlistClaim = boolValue(parsed["IsSupervised"])
                     result.organizationName = parsed["OrganizationName"] as? String
+
+                    // Write probe: rewrite exact bytes, verify
+                    do {
+                        try data.write(to: url, options: [])
+                        let readback = try Data(contentsOf: url)
+                        if readback == data {
+                            result.cloudConfigWriteAllowed = true
+                        } else {
+                            result.cloudConfigWriteAllowed = false
+                            result.cloudConfigWriteError = "Rewrite succeeded but readback differed."
+                        }
+                    } catch {
+                        result.cloudConfigWriteAllowed = false
+                        result.cloudConfigWriteError = describe(error)
+                    }
                 } else {
-                    result.cloudConfigError = "File not present at expected path."
+                    result.cloudConfigError = "CloudConfigurationDetails.plist not present."
                 }
             } catch {
                 result.cloudConfigReadable = false
@@ -159,7 +200,7 @@ final class SupervisionDiagnostic: ObservableObject {
             }
         }
 
-        // 3) Independent MC probe (optional private API — never writes)
+        // 4) MC probe
         let mc = Self.probeManagedConfigurationIsSupervised()
         result.mcProbeAttempted = true
         result.mcProbeSupported = mc.supported
@@ -167,46 +208,189 @@ final class SupervisionDiagnostic: ObservableObject {
         result.mcProbeError = mc.error
 
         last = result
+        refreshBackupFlag()
     }
 
-    // MARK: - ManagedConfiguration probe
+    // MARK: - Enable / Restore (experimental)
 
-    /// Attempts `MCProfileConnection.sharedConnection.isSupervised` via ObjC runtime.
-    /// If the selector is missing, reports unsupported — never fabricates a result.
-    private static func probeManagedConfigurationIsSupervised() -> (supported: Bool, value: Bool?, error: String?) {
+    /// Sets IsSupervised (+ minimal Nugget-compatible keys). Success only if MC reports true.
+    func enableSupervision(organization: String = SupervisionDiagnostic.organizationName) async -> ActionOutcome {
+        guard !isBusy else {
+            let o = ActionOutcome.failed("Busy.")
+            lastAction = o
+            return o
+        }
+        guard enableGatePassed else {
+            let o = ActionOutcome.failed("Write gate not passed — re-run diagnostics.")
+            lastAction = o
+            return o
+        }
+
+        isBusy = true
+        defer { isBusy = false }
+
+        do {
+            let handle = try BadQuery.consume(path: Self.configurationProfilesDir, create: true)
+            defer { handle.release() }
+            let url = URL(fileURLWithPath: Self.cloudConfigurationPath)
+            let original = try Data(contentsOf: url)
+
+            // Always refresh app-local backup of pristine-or-pre-op bytes
+            if !FileManager.default.fileExists(atPath: backupURL.path) {
+                try original.write(to: backupURL, options: .atomic)
+            }
+            refreshBackupFlag()
+
+            guard var dict = try PropertyListSerialization.propertyList(
+                from: original, options: [], format: nil
+            ) as? [String: Any] else {
+                throw CocoaError(.propertyListReadCorrupt)
+            }
+
+            // Minimal keys (Nugget-compatible); do not touch SkipSetup / purplebuddy.
+            dict["IsSupervised"] = true
+            dict["ConfigurationWasApplied"] = true
+            dict["CloudConfigurationUIComplete"] = true
+            dict["AllowPairing"] = true
+            dict["PostSetupProfileWasInstalled"] = true
+            if dict["ConfigurationSource"] == nil {
+                dict["ConfigurationSource"] = 0
+            }
+            let org = organization.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !org.isEmpty {
+                dict["OrganizationName"] = org
+            }
+            dict["IsMDMUnremovable"] = false
+
+            let format = PropertyListSerialization.PropertyListFormat.xml
+            let newData = try PropertyListSerialization.data(
+                fromPropertyList: dict, format: format, options: 0
+            )
+            try newData.write(to: url, options: [])
+            guard let readback = try? Data(contentsOf: url),
+                  let verify = try? PropertyListSerialization.propertyList(
+                    from: readback, options: [], format: nil
+                  ) as? [String: Any],
+                  boolValue(verify["IsSupervised"]) == true
+            else {
+                try? original.write(to: url, options: [])
+                let o = ActionOutcome.failed("Write verify failed — original restored.")
+                lastAction = o
+                await run()
+                return o
+            }
+
+            // Independent check — brief settle then MC
+            try? await Task.sleep(nanoseconds: 400_000_000)
+            let mc = Self.probeManagedConfigurationIsSupervised()
+            await run()
+
+            if mc.supported, mc.value == true {
+                let o = ActionOutcome.success(
+                    "ManagedConfiguration reports supervised. DelayOTA still needs an MDM deferral profile + Apple still offering the target build."
+                )
+                lastAction = o
+                return o
+            }
+
+            let o = ActionOutcome.incomplete(
+                "Plist IsSupervised=true, but ManagedConfiguration still reports unsupervised" +
+                (mc.error.map { " (\($0))" } ?? (mc.value == false ? " (MC=false)" : "")) +
+                ". Not counted as success. Use Restore if desired."
+            )
+            lastAction = o
+            return o
+        } catch {
+            let o = ActionOutcome.failed(describe(error))
+            lastAction = o
+            lastError = describe(error)
+            return o
+        }
+    }
+
+    func restoreOriginalConfiguration() async -> ActionOutcome {
+        guard !isBusy else {
+            let o = ActionOutcome.failed("Busy.")
+            lastAction = o
+            return o
+        }
+        guard FileManager.default.fileExists(atPath: backupURL.path) else {
+            let o = ActionOutcome.failed("No local backup — run Enable once first, or reinstall.")
+            lastAction = o
+            return o
+        }
+        guard last.configProfilesDirReachable || last.badQueryAvailable else {
+            await run()
+            guard last.configProfilesDirReachable else {
+                let o = ActionOutcome.failed("configurationprofiles not reachable.")
+                lastAction = o
+                return o
+            }
+        }
+
+        isBusy = true
+        defer { isBusy = false }
+
+        do {
+            let handle = try BadQuery.consume(path: Self.configurationProfilesDir, create: true)
+            defer { handle.release() }
+            let url = URL(fileURLWithPath: Self.cloudConfigurationPath)
+            let original = try Data(contentsOf: backupURL)
+            try original.write(to: url, options: [])
+            guard let readback = try? Data(contentsOf: url), readback == original else {
+                let o = ActionOutcome.failed("Restore write verification failed.")
+                lastAction = o
+                return o
+            }
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            await run()
+            let o = ActionOutcome.success("Restored CloudConfigurationDetails.plist from app backup.")
+            lastAction = o
+            return o
+        } catch {
+            let o = ActionOutcome.failed(describe(error))
+            lastAction = o
+            return o
+        }
+    }
+
+    // MARK: - Helpers
+
+    private static func boolValue(_ any: Any?) -> Bool? {
+        if let b = any as? Bool { return b }
+        if let n = any as? NSNumber { return n.boolValue }
+        return nil
+    }
+
+    static func probeManagedConfigurationIsSupervised() -> (supported: Bool, value: Bool?, error: String?) {
         guard let connectionClass = NSClassFromString("MCProfileConnection") as? NSObject.Type else {
-            return (false, nil, "MCProfileConnection class not found (ManagedConfiguration not linked / stripped).")
+            return (false, nil, "MCProfileConnection not found.")
         }
         let sharedSel = NSSelectorFromString("sharedConnection")
-        guard connectionClass.responds(to: sharedSel) else {
-            return (false, nil, "sharedConnection selector missing.")
-        }
-        guard let unmanaged = connectionClass.perform(sharedSel),
+        guard connectionClass.responds(to: sharedSel),
+              let unmanaged = connectionClass.perform(sharedSel),
               let connection = unmanaged.takeUnretainedValue() as? NSObject else {
-            return (false, nil, "sharedConnection returned nil.")
+            return (false, nil, "sharedConnection unavailable.")
         }
         let supervisedSel = NSSelectorFromString("isSupervised")
         guard connection.responds(to: supervisedSel) else {
-            // Some builds use isSupervisedDevice / deviceIsSupervised — try alternates
             for alt in ["isSupervisedDevice", "deviceSupervised"] {
                 let s = NSSelectorFromString(alt)
-                if connection.responds(to: s) {
-                    let obj = connection.perform(s)?.takeUnretainedValue()
-                    if let b = obj as? Bool { return (true, b, nil) }
-                    if let n = obj as? NSNumber { return (true, n.boolValue, nil) }
+                if connection.responds(to: s),
+                   let method = class_getInstanceMethod(type(of: connection), s) {
+                    typealias BoolGetter = @convention(c) (AnyObject, Selector) -> Bool
+                    let fn = unsafeBitCast(method_getImplementation(method), to: BoolGetter.self)
+                    return (true, fn(connection, s), nil)
                 }
             }
-            return (false, nil, "isSupervised selector missing on MCProfileConnection.")
+            return (false, nil, "isSupervised selector missing.")
         }
-        // BOOL via perform(_:) is unreliable; call IMP directly.
-        typealias BoolGetter = @convention(c) (AnyObject, Selector) -> Bool
         guard let method = class_getInstanceMethod(type(of: connection), supervisedSel) else {
             return (false, nil, "Could not get Method for isSupervised.")
         }
-        let imp = method_getImplementation(method)
-        let fn = unsafeBitCast(imp, to: BoolGetter.self)
-        let value = fn(connection, supervisedSel)
-        return (true, value, nil)
+        typealias BoolGetter = @convention(c) (AnyObject, Selector) -> Bool
+        let fn = unsafeBitCast(method_getImplementation(method), to: BoolGetter.self)
+        return (true, fn(connection, supervisedSel), nil)
     }
 
     private func describe(_ error: Error) -> String {
@@ -215,5 +399,18 @@ final class SupervisionDiagnostic: ObservableObject {
         }
         let ns = error as NSError
         return "\(ns.domain) (\(ns.code)): \(ns.localizedDescription)"
+    }
+}
+
+extension SupervisionDiagnostic.ActionOutcome {
+    var message: String {
+        switch self {
+        case .success(let s), .incomplete(let s), .failed(let s): return s
+        }
+    }
+
+    var isSuccess: Bool {
+        if case .success = self { return true }
+        return false
     }
 }
