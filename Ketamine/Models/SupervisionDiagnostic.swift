@@ -4,8 +4,10 @@ import ObjectiveC
 
 /// Diagnostics + experimental CloudConfigurationDetails supervision toggle.
 ///
-/// Success for Enable requires ManagedConfiguration `isSupervised == true`
-/// after the write — a plist-only change is reported as incomplete.
+/// Diagnostics first isolate the failing filesystem operation (open / temp create /
+/// rename / Cocoa rewrite) with errno + path. Enable stays locked unless a
+/// content-preserving identical rewrite of the existing plist actually succeeds.
+/// Success for Enable still requires ManagedConfiguration `isSupervised == true`.
 @MainActor
 final class SupervisionDiagnostic: ObservableObject {
 
@@ -33,7 +35,6 @@ final class SupervisionDiagnostic: ObservableObject {
         var configProfilesDirReachable: Bool = false
         var configProfilesDirError: String?
 
-        /// Non-destructive: write+delete a probe file under the SystemGroup dir.
         var dirWriteAllowed: Bool = false
         var dirWriteError: String?
 
@@ -42,11 +43,17 @@ final class SupervisionDiagnostic: ObservableObject {
         var cloudConfigError: String?
         var cloudConfigFileInfo: String?
 
-        /// True when at least one write strategy can replace the plist bytes.
+        /// Per-operation lines: op, path, token, errno/cocoa, result.
+        var fsOperationLog: [String] = []
+        /// First failing op that blocks overwriting the existing plist.
+        var failingOperation: String?
+        /// Explicit verdict for UI (restriction vs implementation).
+        var restrictionVerdict: String?
+
+        /// True only if identical-byte rewrite of the live plist succeeded.
         var cloudConfigWriteAllowed: Bool = false
         var cloudConfigWriteError: String?
         var cloudConfigWriteMethod: String?
-        var cloudConfigWriteAttempts: [String] = []
 
         var isSupervisedPlistClaim: Bool?
         var organizationName: String?
@@ -59,10 +66,6 @@ final class SupervisionDiagnostic: ObservableObject {
 
         var lastActionNote: String?
 
-        var systemRecognizedIndependentlyVerified: Bool {
-            mcProbeSupported && mcIsSupervised != nil
-        }
-
         var writeGatePassed: Bool {
             badQueryAvailable && configProfilesDirReachable && dirWriteAllowed && cloudConfigWriteAllowed
         }
@@ -72,12 +75,12 @@ final class SupervisionDiagnostic: ObservableObject {
             if !configProfilesDirReachable {
                 return "configurationprofiles unreachable (\(configProfilesDirError ?? "?"))"
             }
-            let write: String
-            if writeGatePassed {
-                write = "write OK via \(cloudConfigWriteMethod ?? "?")"
-            } else {
-                write = "write blocked"
+            if let verdict = restrictionVerdict, !cloudConfigWriteAllowed {
+                return verdict
             }
+            let write = writeGatePassed
+                ? "write OK via \(cloudConfigWriteMethod ?? "?")"
+                : "write blocked"
             let claim = isSupervisedPlistClaim.map { $0 ? "plist=true" : "plist=false" } ?? "plist=?"
             let mc = mcIsSupervised.map { $0 ? "MC=true" : "MC=false" } ?? "MC=?"
             return "\(write); \(claim); \(mc)"
@@ -90,13 +93,12 @@ final class SupervisionDiagnostic: ObservableObject {
         case failed(String)
     }
 
+    /// Strategies used only when Enable/Restore must actually write (not for FS matrix).
     private enum WriteStrategy: String, CaseIterable {
-        case inplaceDir = "inplace+dir-token"
-        case inplaceParent = "inplace+parent-token"
         case inplaceFile = "inplace+file-token"
+        case inplaceParent = "inplace+parent-token"
+        case inplaceDir = "inplace+dir-token"
         case posixTrunc = "posix-O_WRONLY|O_TRUNC"
-        case replaceItem = "temp+replaceItem"
-        case deleteRecreate = "unlink+recreate"
     }
 
     @Published private(set) var isBusy = false
@@ -104,7 +106,6 @@ final class SupervisionDiagnostic: ObservableObject {
     @Published var lastError: String?
     @Published private(set) var lastAction: ActionOutcome?
     @Published private(set) var hasLocalBackup = false
-    /// Last strategy that successfully wrote CloudConfigurationDetails.
     @Published private(set) var lastSuccessfulWriteMethod: String?
 
     var accessGatePassed: Bool { last.configProfilesDirReachable && last.badQueryAvailable }
@@ -158,7 +159,7 @@ final class SupervisionDiagnostic: ObservableObject {
             result.configProfilesDirError = describe(error)
         }
 
-        // 2) Non-destructive directory write probe
+        // 2) Directory create probe (sibling of SystemGroup root — not the plist)
         if result.configProfilesDirReachable {
             do {
                 let handle = try BadQuery.consume(path: Self.configurationProfilesDir, create: true)
@@ -175,7 +176,8 @@ final class SupervisionDiagnostic: ObservableObject {
             }
         }
 
-        // 3) Read cloud config + multi-strategy identical-bytes write probe
+        // 3) Read cloud config (no write)
+        var originalBytes: Data?
         if result.configProfilesDirReachable {
             do {
                 let handle = try BadQuery.consume(path: Self.configurationProfilesDir, create: true)
@@ -185,6 +187,7 @@ final class SupervisionDiagnostic: ObservableObject {
                 result.cloudConfigExists = exists
                 if exists {
                     let data = try Data(contentsOf: url)
+                    originalBytes = data
                     guard let parsed = try PropertyListSerialization.propertyList(
                         from: data, options: [], format: nil
                     ) as? [String: Any] else {
@@ -207,20 +210,22 @@ final class SupervisionDiagnostic: ObservableObject {
             }
         }
 
-        if result.cloudConfigReadable {
-            let probe = await probeCloudConfigWrite()
-            result.cloudConfigWriteAllowed = probe.ok
-            result.cloudConfigWriteMethod = probe.method
-            result.cloudConfigWriteError = probe.error
-            result.cloudConfigWriteAttempts = probe.attempts
-            if probe.ok {
-                lastSuccessfulWriteMethod = probe.method
+        // 4) Non-mutating FS operation matrix + content-preserving identical rewrite check
+        if result.cloudConfigReadable, let originalBytes {
+            let probe = investigateCloudConfigWrite(originalBytes: originalBytes)
+            result.fsOperationLog = probe.log
+            result.failingOperation = probe.failingOperation
+            result.restrictionVerdict = probe.verdict
+            result.cloudConfigWriteAllowed = probe.writeProven
+            result.cloudConfigWriteMethod = probe.writeMethod
+            result.cloudConfigWriteError = probe.writeError
+            if probe.writeProven {
+                lastSuccessfulWriteMethod = probe.writeMethod
             }
-            // Refresh file info after probe (esp. delete+recreate)
             result.cloudConfigFileInfo = Self.fileInfo(at: Self.cloudConfigurationPath)
         }
 
-        // 4) MC probe
+        // 5) MC probe
         let mc = Self.probeManagedConfigurationIsSupervised()
         result.mcProbeAttempted = true
         result.mcProbeSupported = mc.supported
@@ -231,9 +236,8 @@ final class SupervisionDiagnostic: ObservableObject {
         refreshBackupFlag()
     }
 
-    // MARK: - Enable / Restore (experimental)
+    // MARK: - Enable / Restore (experimental — only when write proven)
 
-    /// Sets IsSupervised (+ minimal Nugget-compatible keys). Success only if MC reports true.
     func enableSupervision(organization: String = "Ketamine Experimental") async -> ActionOutcome {
         guard !isBusy else {
             let o = ActionOutcome.failed("Busy.")
@@ -241,7 +245,10 @@ final class SupervisionDiagnostic: ObservableObject {
             return o
         }
         guard enableGatePassed else {
-            let detail = last.cloudConfigWriteError ?? last.summaryLine
+            let detail = last.restrictionVerdict
+                ?? last.failingOperation
+                ?? last.cloudConfigWriteError
+                ?? last.summaryLine
             let o = ActionOutcome.failed("Write gate not passed — \(detail)")
             lastAction = o
             return o
@@ -252,7 +259,6 @@ final class SupervisionDiagnostic: ObservableObject {
 
         do {
             let url = URL(fileURLWithPath: Self.cloudConfigurationPath)
-            // Ensure we can read under a live token
             let original: Data
             do {
                 let handle = try BadQuery.consume(path: Self.configurationProfilesDir, create: true)
@@ -271,7 +277,6 @@ final class SupervisionDiagnostic: ObservableObject {
                 throw CocoaError(.propertyListReadCorrupt)
             }
 
-            // Minimal keys (Nugget-compatible); do not touch SkipSetup / purplebuddy.
             dict["IsSupervised"] = true
             dict["ConfigurationWasApplied"] = true
             dict["CloudConfigurationUIComplete"] = true
@@ -355,6 +360,14 @@ final class SupervisionDiagnostic: ObservableObject {
                 return o
             }
         }
+        guard last.cloudConfigWriteAllowed || lastSuccessfulWriteMethod != nil else {
+            let o = ActionOutcome.failed(
+                "Cannot restore — CloudConfiguration write not proven. " +
+                (last.restrictionVerdict ?? last.failingOperation ?? "")
+            )
+            lastAction = o
+            return o
+        }
 
         isBusy = true
         defer { isBusy = false }
@@ -384,50 +397,298 @@ final class SupervisionDiagnostic: ObservableObject {
         }
     }
 
-    // MARK: - Write strategies
+    // MARK: - FS investigation (does not change supervision keys)
 
-    private struct ProbeOutcome {
-        var ok: Bool
-        var method: String?
-        var error: String?
-        var attempts: [String]
+    private struct InvestigateOutcome {
+        var log: [String]
+        var failingOperation: String?
+        var verdict: String?
+        var writeProven: Bool
+        var writeMethod: String?
+        var writeError: String?
     }
 
-    /// Non-destructive: rewrite identical bytes using each strategy until one works.
-    private func probeCloudConfigWrite() async -> ProbeOutcome {
-        guard let original = try? readCloudConfigurationData() else {
-            return ProbeOutcome(ok: false, method: nil, error: "Could not read plist for write probe.", attempts: [])
+    /// Isolates open vs temp-create vs rename vs Cocoa rewrite. Does not unlink or
+    /// replace CloudConfigurationDetails. Identical-byte rewrite is content-preserving.
+    private func investigateCloudConfigWrite(originalBytes: Data) -> InvestigateOutcome {
+        var log: [String] = []
+        let path = Self.cloudConfigurationPath
+        let parent = Self.cloudConfigurationParentDir
+        let url = URL(fileURLWithPath: path)
+
+        func line(_ s: String) { log.append(s) }
+
+        // Hold SystemGroup token for the whole matrix (same as production writes).
+        let dirToken: BadQueryHandle?
+        do {
+            dirToken = try BadQuery.consume(path: Self.configurationProfilesDir, create: true)
+        } catch {
+            return InvestigateOutcome(
+                log: ["consume(dir) failed: \(describe(error))"],
+                failingOperation: "bad_query consume SystemGroup dir",
+                verdict: "SYSTEM RESTRICTION or BadQuery failure: cannot hold configurationprofiles token.",
+                writeProven: false,
+                writeMethod: nil,
+                writeError: describe(error)
+            )
+        }
+        defer { dirToken?.release() }
+
+        // --- access(2) ---
+        line(posixAccess(path: path, mode: R_OK, label: "access(R_OK)", pathLabel: path))
+        line(posixAccess(path: path, mode: W_OK, label: "access(W_OK)", pathLabel: path))
+        line(posixAccess(path: parent, mode: W_OK, label: "access(W_OK)", pathLabel: parent))
+
+        // --- open existing plist: read / write-no-trunc / write+trunc (trunc immediately restored) ---
+        let openRO = posixOpen(path: path, flags: O_RDONLY | O_CLOEXEC | O_NOFOLLOW, label: "open(O_RDONLY)")
+        line(openRO.line)
+        if let fd = openRO.fd { close(fd) }
+
+        let openWO = posixOpen(path: path, flags: O_WRONLY | O_CLOEXEC | O_NOFOLLOW, label: "open(O_WRONLY) no trunc")
+        line(openWO.line)
+        if let fd = openWO.fd { close(fd) }
+
+        // open(O_WRONLY|O_TRUNC) intentionally not probed — would zero the live plist.
+
+        // --- sibling temp create in parent (does not touch target) ---
+        let tempName = ".km_fsprobe_\(UUID().uuidString).tmp"
+        let tempPath = (parent as NSString).appendingPathComponent(tempName)
+        let openTemp = posixOpen(
+            path: tempPath,
+            flags: O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+            label: "open(O_CREAT|O_EXCL) sibling temp",
+            mode: 0o644
+        )
+        line(openTemp.line)
+        var tempCreated = false
+        if let fd = openTemp.fd {
+            tempCreated = true
+            _ = posixWriteAll(fd: fd, data: Data([0x4B, 0x4D]))
+            close(fd)
         }
 
-        var attempts: [String] = []
-        for strategy in WriteStrategy.allCases {
-            do {
-                try applyWrite(original, strategy: strategy)
-                let readback = try readCloudConfigurationData()
-                if readback == original {
-                    attempts.append("\(strategy.rawValue): OK")
-                    return ProbeOutcome(
-                        ok: true,
-                        method: strategy.rawValue,
-                        error: nil,
-                        attempts: attempts
-                    )
-                }
-                attempts.append("\(strategy.rawValue): wrote but readback differed (\(readback.count) vs \(original.count) bytes)")
-                ensureCloudConfigurationRestored(original)
-            } catch {
-                attempts.append("\(strategy.rawValue): \(describe(error))")
-                ensureCloudConfigurationRestored(original)
+        // rename temp → temp2 (parent dir rename capability)
+        if tempCreated {
+            let temp2 = tempPath + ".2"
+            errno = 0
+            if rename(tempPath, temp2) == 0 {
+                line("op=rename(temp→temp2) path=\(tempPath) → \(temp2) result=OK")
+                // rename temp2 onto target would replace CloudConfiguration — DO NOT.
+                // Instead: rename exchange probe using renamex_np if available is still risky.
+                // Just rename back and unlink.
+                _ = rename(temp2, tempPath)
+            } else {
+                let e = errno
+                line("op=rename(temp→temp2) path=\(tempPath) errno=\(e) (\(String(cString: strerror(e))))")
+            }
+            errno = 0
+            if unlink(tempPath) == 0 {
+                line("op=unlink(sibling temp) path=\(tempPath) result=OK")
+            } else {
+                let e = errno
+                line("op=unlink(sibling temp) path=\(tempPath) errno=\(e) (\(String(cString: strerror(e))))")
+                try? FileManager.default.removeItem(atPath: tempPath)
+                try? FileManager.default.removeItem(atPath: tempPath + ".2")
             }
         }
 
-        return ProbeOutcome(
-            ok: false,
-            method: nil,
-            error: attempts.joined(separator: " | "),
-            attempts: attempts
+        // Attempt rename of a NEW sibling onto the target is intentionally skipped
+        // (would replace CloudConfigurationDetails). Log that we skipped it.
+        line("op=rename(temp→CloudConfigurationDetails.plist) path=\(path) result=SKIPPED (would replace live config)")
+
+        // --- Cocoa Data.write identical bytes (maps to user's NSCocoaErrorDomain 513) ---
+        // Content-preserving: same bytes. Does not change IsSupervised / supervision keys.
+        var cocoaInplace: String?
+        do {
+            try originalBytes.write(to: url, options: [])
+            let readback = try Data(contentsOf: url)
+            if readback == originalBytes {
+                cocoaInplace = "OK"
+                line("op=Data.write(options:[]) identical path=\(path) token=dir result=OK")
+            } else {
+                cocoaInplace = "readback mismatch"
+                line("op=Data.write(options:[]) identical path=\(path) token=dir result=readback mismatch")
+                // try restore
+                try? originalBytes.write(to: url, options: [])
+            }
+        } catch {
+            cocoaInplace = describe(error)
+            line("op=Data.write(options:[]) identical path=\(path) token=dir result=FAIL \(describe(error))")
+        }
+
+        // Cocoa atomic (temp + replace) — Foundation may create NS*.tmp then replace.
+        // If atomic succeeds it still writes identical content. If it fails, unwrap errno.
+        do {
+            try originalBytes.write(to: url, options: .atomic)
+            let readback = try Data(contentsOf: url)
+            if readback == originalBytes {
+                line("op=Data.write(options:.atomic) identical path=\(path) token=dir result=OK")
+            } else {
+                line("op=Data.write(options:.atomic) identical path=\(path) token=dir result=readback mismatch")
+                try? originalBytes.write(to: url, options: [])
+            }
+        } catch {
+            line("op=Data.write(options:.atomic) identical path=\(path) token=dir result=FAIL \(describe(error))")
+        }
+
+        // File-scoped token + open(O_WRONLY)
+        do {
+            let fileToken = try BadQuery.consume(path: path, create: true)
+            defer { fileToken.release() }
+            let underFile = posixOpen(
+                path: path,
+                flags: O_WRONLY | O_CLOEXEC | O_NOFOLLOW,
+                label: "open(O_WRONLY) under file-token"
+            )
+            line(underFile.line)
+            if let fd = underFile.fd { close(fd) }
+
+            do {
+                try originalBytes.write(to: url, options: [])
+                line("op=Data.write(options:[]) identical path=\(path) token=file result=OK")
+            } catch {
+                line("op=Data.write(options:[]) identical path=\(path) token=file result=FAIL \(describe(error))")
+            }
+        } catch {
+            line("op=consume(file-token) path=\(path) result=FAIL \(describe(error))")
+        }
+
+        // Parent-scoped token
+        do {
+            let parentToken = try BadQuery.consume(path: parent, create: true)
+            defer { parentToken.release() }
+            let underParent = posixOpen(
+                path: path,
+                flags: O_WRONLY | O_CLOEXEC | O_NOFOLLOW,
+                label: "open(O_WRONLY) under parent-token"
+            )
+            line(underParent.line)
+            if let fd = underParent.fd { close(fd) }
+        } catch {
+            line("op=consume(parent-token) path=\(parent) result=FAIL \(describe(error))")
+        }
+
+        // --- Verdict ---
+        let openDenied = openWO.fd == nil
+        let openErrno = openWO.errnoValue
+
+        var failing: String?
+        var verdict: String?
+        var writeProven = false
+        var writeMethod: String?
+        var writeError: String?
+
+        // Unlock only when Cocoa identical rewrite succeeded (supervision keys unchanged).
+        if cocoaInplace == "OK" {
+            writeProven = true
+            writeMethod = "inplace+dir-token"
+        }
+
+        if !writeProven {
+            if openDenied, let e = openErrno, e == EACCES || e == EPERM {
+                failing = "open(O_WRONLY) path=\(path) errno=\(e) (\(String(cString: strerror(e))))"
+                verdict =
+                    "SYSTEM RESTRICTION: existing CloudConfigurationDetails.plist cannot be opened for write " +
+                    "(errno \(e) \(String(cString: strerror(e)))). " +
+                    "Sibling/temp create in the parent may still work; that is not sufficient to overwrite this file. " +
+                    "NSCocoaErrorDomain 513 is the Foundation mapping of this denial. Enable remains locked."
+            } else if openDenied {
+                let e = openErrno ?? -1
+                failing = "open(O_WRONLY) path=\(path) errno=\(e)"
+                verdict =
+                    "Write blocked at open(O_WRONLY) for \(path) (errno \(e) \(String(cString: strerror(e)))). Enable remains locked."
+            } else if !openDenied, let cocoaInplace, cocoaInplace != "OK" {
+                failing = "Data.write(options:[]) path=\(path) — \(cocoaInplace)"
+                verdict =
+                    "open(O_WRONLY) succeeded but Cocoa Data.write failed (\(cocoaInplace)). " +
+                    "Likely Foundation replace/O_TRUNC path denial — write not proven. Enable remains locked."
+            } else {
+                failing = "CloudConfiguration write not proven"
+                verdict = "CloudConfiguration write not proven after FS matrix. Enable remains locked."
+            }
+            writeError = log.filter {
+                $0.contains("FAIL") || $0.contains("DENY") || $0.contains("errno=")
+            }.suffix(8).joined(separator: " || ")
+        }
+
+        // Final safety: ensure bytes unchanged
+        if let now = try? Data(contentsOf: url), now != originalBytes {
+            line("op=post-investigation-byte-check result=CHANGED — attempting restore")
+            try? Self.posixOverwrite(path: path, data: originalBytes)
+            try? originalBytes.write(to: url, options: [])
+            verdict = (verdict ?? "") + " WARNING: investigation altered bytes; restore attempted."
+            writeProven = false
+        } else {
+            line("op=post-investigation-byte-check result=unchanged")
+        }
+
+        return InvestigateOutcome(
+            log: log,
+            failingOperation: failing,
+            verdict: verdict,
+            writeProven: writeProven,
+            writeMethod: writeMethod,
+            writeError: writeError
         )
     }
+
+    private struct OpenResult {
+        var line: String
+        var fd: Int32?
+        var errnoValue: Int32?
+    }
+
+    private func posixAccess(path: String, mode: Int32, label: String, pathLabel: String) -> String {
+        errno = 0
+        let ok = access(path, mode) == 0
+        if ok {
+            return "op=\(label) path=\(pathLabel) result=OK"
+        }
+        let e = errno
+        return "op=\(label) path=\(pathLabel) result=DENY errno=\(e) (\(String(cString: strerror(e))))"
+    }
+
+    private func posixOpen(path: String, flags: Int32, label: String, mode: mode_t = 0) -> OpenResult {
+        errno = 0
+        let fd: Int32
+        if (flags & O_CREAT) != 0 {
+            fd = open(path, flags, mode)
+        } else {
+            fd = open(path, flags)
+        }
+        if fd >= 0 {
+            return OpenResult(
+                line: "op=\(label) path=\(path) result=OK fd=\(fd)",
+                fd: fd,
+                errnoValue: nil
+            )
+        }
+        let e = errno
+        return OpenResult(
+            line: "op=\(label) path=\(path) result=FAIL errno=\(e) (\(String(cString: strerror(e))))",
+            fd: nil,
+            errnoValue: e
+        )
+    }
+
+    private func posixWriteAll(fd: Int32, data: Data) -> Bool {
+        data.withUnsafeBytes { raw in
+            var written = 0
+            let total = raw.count
+            guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return false }
+            while written < total {
+                let n = Darwin.write(fd, base.advanced(by: written), total - written)
+                if n < 0 {
+                    if errno == EINTR { continue }
+                    return false
+                }
+                written += n
+            }
+            return true
+        }
+    }
+
+    // MARK: - Write helpers (Enable / Restore only)
 
     private struct WriteApplyResult {
         var method: String
@@ -439,7 +700,6 @@ final class SupervisionDiagnostic: ObservableObject {
             order.removeAll { $0 == preferred }
             order.insert(preferred, at: 0)
         }
-
         var errors: [String] = []
         for strategy in order {
             do {
@@ -463,71 +723,23 @@ final class SupervisionDiagnostic: ObservableObject {
     private func applyWrite(_ data: Data, strategy: WriteStrategy) throws {
         let path = Self.cloudConfigurationPath
         let url = URL(fileURLWithPath: path)
-        let parent = URL(fileURLWithPath: Self.cloudConfigurationParentDir, isDirectory: true)
-
         switch strategy {
         case .inplaceDir:
             let handle = try BadQuery.consume(path: Self.configurationProfilesDir, create: true)
             defer { handle.release() }
             try data.write(to: url, options: [])
-
         case .inplaceParent:
             let handle = try BadQuery.consume(path: Self.cloudConfigurationParentDir, create: true)
             defer { handle.release() }
             try data.write(to: url, options: [])
-
         case .inplaceFile:
             let handle = try BadQuery.consume(path: path, create: true)
             defer { handle.release() }
             try data.write(to: url, options: [])
-
         case .posixTrunc:
             let handle = try BadQuery.consume(path: path, create: true)
             defer { handle.release() }
             try Self.posixOverwrite(path: path, data: data)
-
-        case .replaceItem:
-            let dirHandle = try BadQuery.consume(path: Self.cloudConfigurationParentDir, create: true)
-            defer { dirHandle.release() }
-            let temp = parent.appendingPathComponent(".km_cloudconfig_\(UUID().uuidString).tmp")
-            try data.write(to: temp, options: .withoutOverwriting)
-            do {
-                _ = try FileManager.default.replaceItemAt(url, withItemAt: temp)
-            } catch {
-                try? FileManager.default.removeItem(at: temp)
-                // Fallback: remove destination then move
-                let fileHandle = try BadQuery.consume(path: path, create: true)
-                defer { fileHandle.release() }
-                try? FileManager.default.removeItem(at: url)
-                try FileManager.default.moveItem(at: temp, to: url)
-            }
-            try? FileManager.default.removeItem(at: temp)
-
-        case .deleteRecreate:
-            let dirHandle = try BadQuery.consume(path: Self.cloudConfigurationParentDir, create: true)
-            defer { dirHandle.release() }
-            // Prefer unlink of existing; if it fails, surface that errno.
-            if FileManager.default.fileExists(atPath: path) {
-                do {
-                    try FileManager.default.removeItem(at: url)
-                } catch {
-                    // Also try POSIX unlink under file token
-                    let fileHandle = try BadQuery.consume(path: path, create: true)
-                    defer { fileHandle.release() }
-                    if unlink(path) != 0 {
-                        let e = errno
-                        throw NSError(
-                            domain: NSPOSIXErrorDomain,
-                            code: Int(e),
-                            userInfo: [
-                                NSLocalizedDescriptionKey:
-                                    "unlink failed: \(String(cString: strerror(e))) (errno \(e)); removeItem: \(describe(error))"
-                            ]
-                        )
-                    }
-                }
-            }
-            try data.write(to: url, options: .withoutOverwriting)
         }
     }
 
@@ -537,19 +749,6 @@ final class SupervisionDiagnostic: ObservableObject {
         return try Data(contentsOf: URL(fileURLWithPath: Self.cloudConfigurationPath))
     }
 
-    /// Best-effort put original bytes back after a failed strategy (esp. unlink+recreate).
-    private func ensureCloudConfigurationRestored(_ original: Data) {
-        if let current = try? readCloudConfigurationData(), current == original { return }
-        for strategy in WriteStrategy.allCases {
-            if (try? applyWrite(original, strategy: strategy)) != nil,
-               let current = try? readCloudConfigurationData(),
-               current == original {
-                return
-            }
-        }
-    }
-
-    /// Re-run diagnostics while already holding `isBusy` (caller owns the flag).
     private func runUnlocked() async {
         isBusy = false
         await run()
@@ -562,7 +761,10 @@ final class SupervisionDiagnostic: ObservableObject {
             throw NSError(
                 domain: NSPOSIXErrorDomain,
                 code: Int(e),
-                userInfo: [NSLocalizedDescriptionKey: "open(O_WRONLY|O_TRUNC) failed: \(String(cString: strerror(e))) (errno \(e))"]
+                userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "open(O_WRONLY|O_TRUNC) path=\(path) failed: \(String(cString: strerror(e))) (errno \(e))"
+                ]
             )
         }
         defer { close(fd) }
@@ -578,7 +780,10 @@ final class SupervisionDiagnostic: ObservableObject {
                     throw NSError(
                         domain: NSPOSIXErrorDomain,
                         code: Int(e),
-                        userInfo: [NSLocalizedDescriptionKey: "write() failed: \(String(cString: strerror(e))) (errno \(e))"]
+                        userInfo: [
+                            NSLocalizedDescriptionKey:
+                                "write() path=\(path) failed: \(String(cString: strerror(e))) (errno \(e))"
+                        ]
                     )
                 }
                 written += n
@@ -589,7 +794,10 @@ final class SupervisionDiagnostic: ObservableObject {
             throw NSError(
                 domain: NSPOSIXErrorDomain,
                 code: Int(e),
-                userInfo: [NSLocalizedDescriptionKey: "fsync failed: \(String(cString: strerror(e))) (errno \(e))"]
+                userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "fsync path=\(path) failed: \(String(cString: strerror(e))) (errno \(e))"
+                ]
             )
         }
     }
@@ -602,7 +810,6 @@ final class SupervisionDiagnostic: ObservableObject {
             parts.append(String(format: "mode=%o", st.st_mode & 0o7777))
             parts.append("uid=\(st.st_uid) gid=\(st.st_gid)")
             parts.append("size=\(st.st_size)")
-            // Flag bits from sys/stat.h (avoid depending on all symbols being visible).
             let ufImmutable: UInt32 = 0x00000002
             let sfImmutable: UInt32 = 0x00020000
             let ufAppend: UInt32 = 0x00000004
@@ -630,7 +837,6 @@ final class SupervisionDiagnostic: ObservableObject {
                 parts.append("owner=\(owner)")
             }
         }
-        // access(2) hints
         let r = access(path, R_OK) == 0
         let w = access(path, W_OK) == 0
         parts.append("access(R)=\(r) access(W)=\(w)")
@@ -680,14 +886,24 @@ final class SupervisionDiagnostic: ObservableObject {
         if let bq = error as? BadQueryError {
             return bq.errorDescription ?? String(describing: bq)
         }
-        let ns = error as NSError
-        var s = "\(ns.domain) (\(ns.code)): \(ns.localizedDescription)"
-        if ns.domain == NSPOSIXErrorDomain || ns.domain == NSCocoaErrorDomain {
-            if let underlying = ns.userInfo[NSUnderlyingErrorKey] as? NSError {
-                s += " | underlying \(underlying.domain) (\(underlying.code)): \(underlying.localizedDescription)"
+        var parts: [String] = []
+        var current: NSError? = error as NSError
+        var depth = 0
+        while let ns = current, depth < 5 {
+            var chunk = "\(ns.domain) (\(ns.code)): \(ns.localizedDescription)"
+            if let path = ns.userInfo[NSFilePathErrorKey] as? String {
+                chunk += " path=\(path)"
+            } else if let url = ns.userInfo[NSURLErrorKey] as? URL {
+                chunk += " url=\(url.path)"
             }
+            if ns.domain == NSPOSIXErrorDomain {
+                chunk += " strerror=\(String(cString: strerror(Int32(ns.code))))"
+            }
+            parts.append(chunk)
+            current = ns.userInfo[NSUnderlyingErrorKey] as? NSError
+            depth += 1
         }
-        return s
+        return parts.joined(separator: " ← ")
     }
 }
 

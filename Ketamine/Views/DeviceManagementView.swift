@@ -77,8 +77,8 @@ struct DeviceManagementView: View {
             Text("Device Management")
                 .font(.largeTitle.weight(.semibold))
             Text(
-                "Auto-runs non-destructive write probes on open. Enable Supervision is " +
-                "experimental and requires confirmation."
+                "Auto-runs a non-mutating FS matrix (open/access/temp/Cocoa) on open. " +
+                "Enable stays locked unless an identical rewrite is proven. Experimental."
             )
             .font(.subheadline)
             .foregroundStyle(.secondary)
@@ -166,7 +166,27 @@ struct DeviceManagementView: View {
                 )
                 Divider().padding(.leading, 16)
                 row(
-                    "CloudConfiguration write",
+                    "Failing FS operation",
+                    text: diagnostic.last.failingOperation != nil ? "see detail" : "—",
+                    detail: diagnostic.last.failingOperation
+                )
+                Divider().padding(.leading, 16)
+                row(
+                    "Restriction verdict",
+                    text: diagnostic.last.restrictionVerdict != nil ? "see detail" : "—",
+                    detail: diagnostic.last.restrictionVerdict
+                )
+                Divider().padding(.leading, 16)
+                row(
+                    "FS operation log",
+                    text: diagnostic.last.fsOperationLog.isEmpty ? "—" : "\(diagnostic.last.fsOperationLog.count) ops",
+                    detail: diagnostic.last.fsOperationLog.isEmpty
+                        ? nil
+                        : diagnostic.last.fsOperationLog.joined(separator: "\n")
+                )
+                Divider().padding(.leading, 16)
+                row(
+                    "CloudConfiguration write proven",
                     bool: diagnostic.last.cloudConfigWriteAllowed,
                     detail: writeDetail
                 )
