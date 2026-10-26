@@ -18,6 +18,14 @@ struct SystemHubView: View {
                     status
                     VStack(alignment: .leading, spacing: 12) {
                         SectionHeader("Tools")
+                        NavigationLink { DeviceManagementView() } label: {
+                            HubToolCard(
+                                title: "Device Management",
+                                detail: "Read-only supervision / configurationprofiles diagnostics",
+                                symbol: "lock.shield"
+                            )
+                        }
+                        .buttonStyle(.plain)
                         Button { showRestore = true } label: {
                             HubToolCard(
                                 title: "Recovery",

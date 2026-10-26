@@ -1,0 +1,15 @@
+# Xcode / build
+build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+*.ipa
+*.dSYM.zip
+.DS_Store
+
+# Local secrets
+*.p12
+*.mobileprovision
+.env
+.env.*
+Ketamine.xcodeproj/
