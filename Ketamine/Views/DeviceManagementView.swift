@@ -77,8 +77,8 @@ struct DeviceManagementView: View {
             Text("Device Management")
                 .font(.largeTitle.weight(.semibold))
             Text(
-                "Auto-runs a non-mutating FS matrix (open/access/temp/Cocoa) on open. " +
-                "Enable stays locked unless an identical rewrite is proven. Experimental."
+                "Investigates file/parent BadQuery tokens vs dir-token EPERM. " +
+                "Enable unlocks only if identical-byte persist is proven (not open alone). Experimental."
             )
             .font(.subheadline)
             .foregroundStyle(.secondary)
@@ -296,11 +296,10 @@ struct DeviceManagementView: View {
 
     private var delayOTANote: some View {
         VStack(alignment: .leading, spacing: 8) {
-            SectionHeader("DelayOTA")
+            SectionHeader("Proof layers")
             Text(
-                "Even if MC reports supervised, DelayOTA still needs your MDM deferral profile " +
-                "(e.g. Mareades forceDelayedSoftwareUpdates) and Apple must still serve iOS 27.0.1. " +
-                "Status after Enable: verified only for MC supervision — DelayOTA remains unknown until you test updates UI / MDM."
+                "1) open O_WRONLY under token ≠ 2) persist bytes ≠ 3) MC isSupervised ≠ 4) DelayOTA. " +
+                "Layer 4 still needs Mareades deferral profile + Apple serving 27.0.1."
             )
             .font(.caption)
             .foregroundStyle(.secondary)

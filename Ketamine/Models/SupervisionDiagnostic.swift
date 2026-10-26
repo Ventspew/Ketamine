@@ -93,12 +93,13 @@ final class SupervisionDiagnostic: ObservableObject {
         case failed(String)
     }
 
-    /// Strategies used only when Enable/Restore must actually write (not for FS matrix).
+    /// Strategies used only when Enable/Restore must actually write.
+    /// Prefer file-token POSIX — dir-token open(O_WRONLY) fails with EPERM on this device.
     private enum WriteStrategy: String, CaseIterable {
-        case inplaceFile = "inplace+file-token"
-        case inplaceParent = "inplace+parent-token"
-        case inplaceDir = "inplace+dir-token"
-        case posixTrunc = "posix-O_WRONLY|O_TRUNC"
+        case posixFileToken = "posix-fd+file-token"
+        case posixParentToken = "posix-fd+parent-token"
+        case cocoaFileToken = "cocoa+file-token"
+        case cocoaParentToken = "cocoa+parent-token"
     }
 
     @Published private(set) var isBusy = false
@@ -408,219 +409,228 @@ final class SupervisionDiagnostic: ObservableObject {
         var writeError: String?
     }
 
-    /// Isolates open vs temp-create vs rename vs Cocoa rewrite. Does not unlink or
-    /// replace CloudConfigurationDetails. Identical-byte rewrite is content-preserving.
+    /// Focus: why file/parent tokens allow open(O_WRONLY) while dir-token gets EPERM,
+    /// whether those fds are the real plist with write mode, and whether identical-byte
+    /// persist works while the token remains held. Never changes supervision keys.
     private func investigateCloudConfigWrite(originalBytes: Data) -> InvestigateOutcome {
         var log: [String] = []
         let path = Self.cloudConfigurationPath
         let parent = Self.cloudConfigurationParentDir
         let url = URL(fileURLWithPath: path)
+        let metaBefore = Self.fileInfo(at: path)
 
         func line(_ s: String) { log.append(s) }
+        line("meta-before \(metaBefore)")
 
-        // Hold SystemGroup token for the whole matrix (same as production writes).
-        let dirToken: BadQueryHandle?
+        // --- A) SystemGroup dir-token only (previous failing path) ---
         do {
-            dirToken = try BadQuery.consume(path: Self.configurationProfilesDir, create: true)
-        } catch {
-            return InvestigateOutcome(
-                log: ["consume(dir) failed: \(describe(error))"],
-                failingOperation: "bad_query consume SystemGroup dir",
-                verdict: "SYSTEM RESTRICTION or BadQuery failure: cannot hold configurationprofiles token.",
-                writeProven: false,
-                writeMethod: nil,
-                writeError: describe(error)
-            )
-        }
-        defer { dirToken?.release() }
-
-        // --- access(2) ---
-        line(posixAccess(path: path, mode: R_OK, label: "access(R_OK)", pathLabel: path))
-        line(posixAccess(path: path, mode: W_OK, label: "access(W_OK)", pathLabel: path))
-        line(posixAccess(path: parent, mode: W_OK, label: "access(W_OK)", pathLabel: parent))
-
-        // --- open existing plist: read / write-no-trunc / write+trunc (trunc immediately restored) ---
-        let openRO = posixOpen(path: path, flags: O_RDONLY | O_CLOEXEC | O_NOFOLLOW, label: "open(O_RDONLY)")
-        line(openRO.line)
-        if let fd = openRO.fd { close(fd) }
-
-        let openWO = posixOpen(path: path, flags: O_WRONLY | O_CLOEXEC | O_NOFOLLOW, label: "open(O_WRONLY) no trunc")
-        line(openWO.line)
-        if let fd = openWO.fd { close(fd) }
-
-        // open(O_WRONLY|O_TRUNC) intentionally not probed — would zero the live plist.
-
-        // --- sibling temp create in parent (does not touch target) ---
-        let tempName = ".km_fsprobe_\(UUID().uuidString).tmp"
-        let tempPath = (parent as NSString).appendingPathComponent(tempName)
-        let openTemp = posixOpen(
-            path: tempPath,
-            flags: O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
-            label: "open(O_CREAT|O_EXCL) sibling temp",
-            mode: 0o644
-        )
-        line(openTemp.line)
-        var tempCreated = false
-        if let fd = openTemp.fd {
-            tempCreated = true
-            _ = posixWriteAll(fd: fd, data: Data([0x4B, 0x4D]))
-            close(fd)
-        }
-
-        // rename temp → temp2 (parent dir rename capability)
-        if tempCreated {
-            let temp2 = tempPath + ".2"
-            errno = 0
-            if rename(tempPath, temp2) == 0 {
-                line("op=rename(temp→temp2) path=\(tempPath) → \(temp2) result=OK")
-                // rename temp2 onto target would replace CloudConfiguration — DO NOT.
-                // Instead: rename exchange probe using renamex_np if available is still risky.
-                // Just rename back and unlink.
-                _ = rename(temp2, tempPath)
-            } else {
-                let e = errno
-                line("op=rename(temp→temp2) path=\(tempPath) errno=\(e) (\(String(cString: strerror(e))))")
+            let dirToken = try BadQuery.consume(path: Self.configurationProfilesDir, create: true)
+            defer { dirToken.release() }
+            line("token=dir handle=\(dirToken.handle) path=\(dirToken.path) active=yes")
+            line(posixAccess(path: path, mode: W_OK, label: "access(W_OK)+dir-token", pathLabel: path))
+            let openDir = posixOpen(path: path, flags: O_WRONLY | O_CLOEXEC | O_NOFOLLOW, label: "open(O_WRONLY)+dir-token")
+            line(openDir.line)
+            if let fd = openDir.fd {
+                line(inspectFd(fd, expectedPath: path))
+                close(fd)
             }
-            errno = 0
-            if unlink(tempPath) == 0 {
-                line("op=unlink(sibling temp) path=\(tempPath) result=OK")
-            } else {
-                let e = errno
-                line("op=unlink(sibling temp) path=\(tempPath) errno=\(e) (\(String(cString: strerror(e))))")
-                try? FileManager.default.removeItem(atPath: tempPath)
-                try? FileManager.default.removeItem(atPath: tempPath + ".2")
-            }
-        }
-
-        // Attempt rename of a NEW sibling onto the target is intentionally skipped
-        // (would replace CloudConfigurationDetails). Log that we skipped it.
-        line("op=rename(temp→CloudConfigurationDetails.plist) path=\(path) result=SKIPPED (would replace live config)")
-
-        // --- Cocoa Data.write identical bytes (maps to user's NSCocoaErrorDomain 513) ---
-        // Content-preserving: same bytes. Does not change IsSupervised / supervision keys.
-        var cocoaInplace: String?
-        do {
-            try originalBytes.write(to: url, options: [])
-            let readback = try Data(contentsOf: url)
-            if readback == originalBytes {
-                cocoaInplace = "OK"
-                line("op=Data.write(options:[]) identical path=\(path) token=dir result=OK")
-            } else {
-                cocoaInplace = "readback mismatch"
-                line("op=Data.write(options:[]) identical path=\(path) token=dir result=readback mismatch")
-                // try restore
-                try? originalBytes.write(to: url, options: [])
-            }
-        } catch {
-            cocoaInplace = describe(error)
-            line("op=Data.write(options:[]) identical path=\(path) token=dir result=FAIL \(describe(error))")
-        }
-
-        // Cocoa atomic (temp + replace) — Foundation may create NS*.tmp then replace.
-        // If atomic succeeds it still writes identical content. If it fails, unwrap errno.
-        do {
-            try originalBytes.write(to: url, options: .atomic)
-            let readback = try Data(contentsOf: url)
-            if readback == originalBytes {
-                line("op=Data.write(options:.atomic) identical path=\(path) token=dir result=OK")
-            } else {
-                line("op=Data.write(options:.atomic) identical path=\(path) token=dir result=readback mismatch")
-                try? originalBytes.write(to: url, options: [])
-            }
-        } catch {
-            line("op=Data.write(options:.atomic) identical path=\(path) token=dir result=FAIL \(describe(error))")
-        }
-
-        // File-scoped token + open(O_WRONLY)
-        do {
-            let fileToken = try BadQuery.consume(path: path, create: true)
-            defer { fileToken.release() }
-            let underFile = posixOpen(
-                path: path,
-                flags: O_WRONLY | O_CLOEXEC | O_NOFOLLOW,
-                label: "open(O_WRONLY) under file-token"
-            )
-            line(underFile.line)
-            if let fd = underFile.fd { close(fd) }
-
             do {
                 try originalBytes.write(to: url, options: [])
-                line("op=Data.write(options:[]) identical path=\(path) token=file result=OK")
+                line("op=Data.write([])+dir-token path=\(path) result=OK")
             } catch {
-                line("op=Data.write(options:[]) identical path=\(path) token=file result=FAIL \(describe(error))")
+                line("op=Data.write([])+dir-token path=\(path) result=FAIL \(describe(error))")
             }
+        } catch {
+            line("op=consume(dir-token) result=FAIL \(describe(error))")
+        }
+
+        // --- B) File-token: open, identify fd, reproduce, identical persist via held fd ---
+        var fileTokenOpenOK = false
+        var fileTokenPersistOK = false
+        var fileTokenFdWriteOK = false
+        var fileTokenIdentityOK = false
+
+        do {
+            let fileToken = try BadQuery.consume(path: path, create: true)
+            defer {
+                line("token=file handle=\(fileToken.handle) release")
+                fileToken.release()
+            }
+            line("token=file handle=\(fileToken.handle) path=\(fileToken.path) active=yes")
+
+            // Reproducibility: two sequential opens while token held
+            let open1 = posixOpen(path: path, flags: O_WRONLY | O_CLOEXEC | O_NOFOLLOW, label: "open(O_WRONLY)+file-token #1")
+            line(open1.line)
+            if let fd = open1.fd {
+                fileTokenOpenOK = true
+                let insp = inspectFd(fd, expectedPath: path)
+                line(insp)
+                fileTokenIdentityOK = insp.contains("inode-match=yes") && insp.contains("write-mode=yes")
+                close(fd)
+            }
+            let open2 = posixOpen(path: path, flags: O_WRONLY | O_CLOEXEC | O_NOFOLLOW, label: "open(O_WRONLY)+file-token #2")
+            line(open2.line)
+            if open2.fd == nil {
+                line("op=reproducibility file-token open #2 failed (not reproducible under held token)")
+            }
+            // Content-preserving persist on a fresh fd while token still held
+            let openPersist = posixOpen(
+                path: path,
+                flags: O_WRONLY | O_CLOEXEC | O_NOFOLLOW,
+                label: "open(O_WRONLY)+file-token persist"
+            )
+            line(openPersist.line)
+            if let fd = openPersist.fd {
+                fileTokenOpenOK = true
+                line(inspectFd(fd, expectedPath: path))
+                let persist = identicalPersistViaFd(fd: fd, path: path, originalBytes: originalBytes)
+                line(persist.line)
+                fileTokenFdWriteOK = persist.writeSyscallOK
+                fileTokenPersistOK = persist.readbackOK
+                close(fd)
+            }
+
+            // Cocoa while file-token still held
+            do {
+                try originalBytes.write(to: url, options: [])
+                let rb = try Data(contentsOf: url)
+                line(
+                    rb == originalBytes
+                        ? "op=Data.write([])+file-token path=\(path) result=OK"
+                        : "op=Data.write([])+file-token path=\(path) result=readback mismatch"
+                )
+                if rb == originalBytes { fileTokenPersistOK = true }
+            } catch {
+                line("op=Data.write([])+file-token path=\(path) result=FAIL \(describe(error))")
+            }
+
+            // Prove token must stay live: open after we will release is checked in section D
         } catch {
             line("op=consume(file-token) path=\(path) result=FAIL \(describe(error))")
         }
 
-        // Parent-scoped token
+        // --- C) Parent-token ---
+        var parentTokenOpenOK = false
+        var parentTokenPersistOK = false
         do {
             let parentToken = try BadQuery.consume(path: parent, create: true)
-            defer { parentToken.release() }
-            let underParent = posixOpen(
-                path: path,
-                flags: O_WRONLY | O_CLOEXEC | O_NOFOLLOW,
-                label: "open(O_WRONLY) under parent-token"
-            )
-            line(underParent.line)
-            if let fd = underParent.fd { close(fd) }
+            defer {
+                line("token=parent handle=\(parentToken.handle) release")
+                parentToken.release()
+            }
+            line("token=parent handle=\(parentToken.handle) path=\(parentToken.path) active=yes")
+            let openP = posixOpen(path: path, flags: O_WRONLY | O_CLOEXEC | O_NOFOLLOW, label: "open(O_WRONLY)+parent-token")
+            line(openP.line)
+            if let fd = openP.fd {
+                parentTokenOpenOK = true
+                line(inspectFd(fd, expectedPath: path))
+                let persist = identicalPersistViaFd(fd: fd, path: path, originalBytes: originalBytes)
+                line(persist.line)
+                if persist.readbackOK { parentTokenPersistOK = true }
+                close(fd)
+            }
         } catch {
             line("op=consume(parent-token) path=\(parent) result=FAIL \(describe(error))")
         }
 
-        // --- Verdict ---
-        let openDenied = openWO.fd == nil
-        let openErrno = openWO.errnoValue
+        // --- D) After file-token released: open should fail again if scope was the cause ---
+        do {
+            let dirToken = try BadQuery.consume(path: Self.configurationProfilesDir, create: true)
+            defer { dirToken.release() }
+            let after = posixOpen(path: path, flags: O_WRONLY | O_CLOEXEC | O_NOFOLLOW, label: "open(O_WRONLY)+dir-token after file-token released")
+            line(after.line)
+            if let fd = after.fd { close(fd) }
+        } catch {
+            line("op=consume(dir-token) post-release check FAIL \(describe(error))")
+        }
 
-        var failing: String?
-        var verdict: String?
+        // Sibling temp under parent (does not touch target) — context only
+        do {
+            let parentToken = try BadQuery.consume(path: parent, create: true)
+            defer { parentToken.release() }
+            let tempPath = (parent as NSString).appendingPathComponent(".km_fsprobe_\(UUID().uuidString).tmp")
+            let openTemp = posixOpen(
+                path: tempPath,
+                flags: O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                label: "open(O_CREAT|O_EXCL) sibling temp +parent-token",
+                mode: 0o644
+            )
+            line(openTemp.line)
+            if let fd = openTemp.fd {
+                _ = posixWriteAll(fd: fd, data: Data([0x4B, 0x4D]))
+                close(fd)
+                _ = unlink(tempPath)
+                line("op=unlink(sibling temp) path=\(tempPath) result=OK")
+            }
+        } catch {
+            line("op=sibling-temp+parent-token FAIL \(describe(error))")
+        }
+
+        line("op=rename(temp→CloudConfigurationDetails.plist) result=SKIPPED (would replace live config)")
+
+        let metaAfter = Self.fileInfo(at: path)
+        line("meta-after \(metaAfter)")
+
+        // Integrity
+        var bytesOK = false
+        if let now = try? Data(contentsOf: url) {
+            bytesOK = (now == originalBytes)
+            line(bytesOK ? "op=post-investigation-byte-check result=unchanged" : "op=post-investigation-byte-check result=CHANGED")
+            if !bytesOK {
+                // Best-effort restore under file-token
+                if let token = try? BadQuery.consume(path: path, create: true) {
+                    defer { token.release() }
+                    try? Self.posixOverwrite(path: path, data: originalBytes)
+                }
+                line("op=emergency-restore-attempted")
+            }
+        }
+
+        // --- Verdict (layered; do not conflate open / persist / MC / DelayOTA) ---
         var writeProven = false
         var writeMethod: String?
-        var writeError: String?
+        var failing: String?
+        var verdict: String?
 
-        // Unlock only when Cocoa identical rewrite succeeded (supervision keys unchanged).
-        if cocoaInplace == "OK" {
+        if fileTokenPersistOK {
             writeProven = true
-            writeMethod = "inplace+dir-token"
-        }
-
-        if !writeProven {
-            if openDenied, let e = openErrno, e == EACCES || e == EPERM {
-                failing = "open(O_WRONLY) path=\(path) errno=\(e) (\(String(cString: strerror(e))))"
-                verdict =
-                    "SYSTEM RESTRICTION: existing CloudConfigurationDetails.plist cannot be opened for write " +
-                    "(errno \(e) \(String(cString: strerror(e)))). " +
-                    "Sibling/temp create in the parent may still work; that is not sufficient to overwrite this file. " +
-                    "NSCocoaErrorDomain 513 is the Foundation mapping of this denial. Enable remains locked."
-            } else if openDenied {
-                let e = openErrno ?? -1
-                failing = "open(O_WRONLY) path=\(path) errno=\(e)"
-                verdict =
-                    "Write blocked at open(O_WRONLY) for \(path) (errno \(e) \(String(cString: strerror(e)))). Enable remains locked."
-            } else if !openDenied, let cocoaInplace, cocoaInplace != "OK" {
-                failing = "Data.write(options:[]) path=\(path) — \(cocoaInplace)"
-                verdict =
-                    "open(O_WRONLY) succeeded but Cocoa Data.write failed (\(cocoaInplace)). " +
-                    "Likely Foundation replace/O_TRUNC path denial — write not proven. Enable remains locked."
-            } else {
-                failing = "CloudConfiguration write not proven"
-                verdict = "CloudConfiguration write not proven after FS matrix. Enable remains locked."
-            }
-            writeError = log.filter {
-                $0.contains("FAIL") || $0.contains("DENY") || $0.contains("errno=")
-            }.suffix(8).joined(separator: " || ")
-        }
-
-        // Final safety: ensure bytes unchanged
-        if let now = try? Data(contentsOf: url), now != originalBytes {
-            line("op=post-investigation-byte-check result=CHANGED — attempting restore")
-            try? Self.posixOverwrite(path: path, data: originalBytes)
-            try? originalBytes.write(to: url, options: [])
-            verdict = (verdict ?? "") + " WARNING: investigation altered bytes; restore attempted."
-            writeProven = false
+            writeMethod = fileTokenFdWriteOK ? "posix-fd+file-token" : "cocoa+file-token"
+            verdict =
+                "WRITE PERSIST PROVEN (layer 2) via \(writeMethod!): file-token yields a writable fd " +
+                "to CloudConfigurationDetails.plist and identical-byte rewrite readback matches. " +
+                "dir-token open alone fails with EPERM — prior NSCocoaErrorDomain 513 was likely " +
+                "using the wrong token scope, not a total ban on this file. " +
+                "This does NOT prove ManagedConfiguration will recognize IsSupervised (layer 3) " +
+                "nor DelayOTA (layer 4). Enable unlocked for explicit confirmed test only."
+        } else if parentTokenPersistOK {
+            writeProven = true
+            writeMethod = "posix-fd+parent-token"
+            verdict =
+                "WRITE PERSIST PROVEN (layer 2) via parent-token identical rewrite. " +
+                "Enable unlocked for explicit confirmed test only. MC/DelayOTA still unproven."
+        } else if fileTokenOpenOK || parentTokenOpenOK {
+            failing =
+                "open(O_WRONLY) under file/parent-token OK but identical persist failed " +
+                "(fdWrite=\(fileTokenFdWriteOK) identity=\(fileTokenIdentityOK))"
+            verdict =
+                "LAYER 1 ONLY: writable fd obtained under file/parent-token " +
+                "(identity \(fileTokenIdentityOK ? "OK" : "unverified")), but persisting identical bytes failed. " +
+                "Open≠persist. Enable remains locked. See FS log for write()/fsync errno."
         } else {
-            line("op=post-investigation-byte-check result=unchanged")
+            failing = "file-token and parent-token open(O_WRONLY) both failed"
+            verdict =
+                "SYSTEM RESTRICTION: cannot open CloudConfigurationDetails.plist for write " +
+                "even with file/parent BadQuery tokens. Enable remains locked."
         }
+
+        if !bytesOK {
+            writeProven = false
+            verdict = (verdict ?? "") + " INTEGRITY FAIL: bytes changed during probe — Enable locked."
+        }
+
+        let writeError = log.filter {
+            $0.contains("FAIL") || $0.contains("DENY") || $0.contains("errno=") || $0.contains("persist")
+        }.suffix(10).joined(separator: " || ")
 
         return InvestigateOutcome(
             log: log,
@@ -628,8 +638,100 @@ final class SupervisionDiagnostic: ObservableObject {
             verdict: verdict,
             writeProven: writeProven,
             writeMethod: writeMethod,
-            writeError: writeError
+            writeError: writeProven ? nil : writeError
         )
+    }
+
+    private struct PersistResult {
+        var line: String
+        var writeSyscallOK: Bool
+        var readbackOK: Bool
+    }
+
+    /// Overwrite with the same bytes through an already-open O_WRONLY fd (token must stay held).
+    private func identicalPersistViaFd(fd: Int32, path: String, originalBytes: Data) -> PersistResult {
+        if lseek(fd, 0, SEEK_SET) < 0 {
+            let e = errno
+            return PersistResult(
+                line: "op=identical-persist lseek path=\(path) errno=\(e) (\(String(cString: strerror(e))))",
+                writeSyscallOK: false,
+                readbackOK: false
+            )
+        }
+        let wrote = posixWriteAll(fd: fd, data: originalBytes)
+        if !wrote {
+            let e = errno
+            return PersistResult(
+                line: "op=identical-persist write() path=\(path) errno=\(e) (\(String(cString: strerror(e))))",
+                writeSyscallOK: false,
+                readbackOK: false
+            )
+        }
+        if fsync(fd) != 0 {
+            let e = errno
+            return PersistResult(
+                line: "op=identical-persist fsync path=\(path) errno=\(e) (\(String(cString: strerror(e))))",
+                writeSyscallOK: false,
+                readbackOK: false
+            )
+        }
+        // Read back via separate open (still expect caller to hold token)
+        guard let readback = try? Data(contentsOf: URL(fileURLWithPath: path)) else {
+            return PersistResult(
+                line: "op=identical-persist readback path=\(path) result=unreadable",
+                writeSyscallOK: true,
+                readbackOK: false
+            )
+        }
+        let ok = readback == originalBytes
+        return PersistResult(
+            line: "op=identical-persist path=\(path) write=OK fsync=OK readback=\(ok ? "match" : "MISMATCH") bytes=\(originalBytes.count)",
+            writeSyscallOK: true,
+            readbackOK: ok
+        )
+    }
+
+    /// fcntl flags + F_GETPATH + inode match vs path lstat.
+    private func inspectFd(_ fd: Int32, expectedPath: String) -> String {
+        var parts: [String] = ["op=fd-inspect fd=\(fd)"]
+        let flags = fcntl(fd, F_GETFL)
+        if flags == -1 {
+            parts.append("F_GETFL errno=\(errno)")
+        } else {
+            let acc = flags & O_ACCMODE
+            let writable = acc == O_WRONLY || acc == O_RDWR
+            parts.append("F_GETFL=\(flags)")
+            parts.append("write-mode=\(writable ? "yes" : "no")")
+            let accName: String
+            switch acc {
+            case O_RDONLY: accName = "RDONLY"
+            case O_WRONLY: accName = "WRONLY"
+            case O_RDWR: accName = "RDWR"
+            default: accName = "other"
+            }
+            parts.append("acc=\(accName)")
+        }
+        var pathBuf = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+        if fcntl(fd, F_GETPATH, &pathBuf) == 0 {
+            let got = String(cString: pathBuf)
+            parts.append("F_GETPATH=\(got)")
+            parts.append("path-match=\(got == expectedPath || got == "/private\(expectedPath)" || expectedPath == "/private\(got)" ? "yes" : "no")")
+        } else {
+            parts.append("F_GETPATH errno=\(errno)")
+        }
+        var stFd = stat()
+        var stPath = stat()
+        let fdOK = fstat(fd, &stFd) == 0
+        let pathOK = lstat(expectedPath, &stPath) == 0
+        if fdOK && pathOK {
+            let match = stFd.st_ino == stPath.st_ino && stFd.st_dev == stPath.st_dev
+            parts.append("inode-match=\(match ? "yes" : "no")")
+            parts.append("fd-ino=\(stFd.st_ino) path-ino=\(stPath.st_ino)")
+            parts.append(String(format: "fd-mode=%o size=%lld", stFd.st_mode & 0o7777, Int64(stFd.st_size)))
+        } else {
+            parts.append("fstat/lstat failed")
+        }
+        return parts.joined(separator: " ")
     }
 
     private struct OpenResult {
@@ -724,22 +826,22 @@ final class SupervisionDiagnostic: ObservableObject {
         let path = Self.cloudConfigurationPath
         let url = URL(fileURLWithPath: path)
         switch strategy {
-        case .inplaceDir:
-            let handle = try BadQuery.consume(path: Self.configurationProfilesDir, create: true)
-            defer { handle.release() }
-            try data.write(to: url, options: [])
-        case .inplaceParent:
-            let handle = try BadQuery.consume(path: Self.cloudConfigurationParentDir, create: true)
-            defer { handle.release() }
-            try data.write(to: url, options: [])
-        case .inplaceFile:
-            let handle = try BadQuery.consume(path: path, create: true)
-            defer { handle.release() }
-            try data.write(to: url, options: [])
-        case .posixTrunc:
+        case .posixFileToken:
             let handle = try BadQuery.consume(path: path, create: true)
             defer { handle.release() }
             try Self.posixOverwrite(path: path, data: data)
+        case .posixParentToken:
+            let handle = try BadQuery.consume(path: Self.cloudConfigurationParentDir, create: true)
+            defer { handle.release() }
+            try Self.posixOverwrite(path: path, data: data)
+        case .cocoaFileToken:
+            let handle = try BadQuery.consume(path: path, create: true)
+            defer { handle.release() }
+            try data.write(to: url, options: [])
+        case .cocoaParentToken:
+            let handle = try BadQuery.consume(path: Self.cloudConfigurationParentDir, create: true)
+            defer { handle.release() }
+            try data.write(to: url, options: [])
         }
     }
 
