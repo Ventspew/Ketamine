@@ -172,7 +172,7 @@ final class SupervisionDiagnostic: ObservableObject {
                     }
                     result.cloudConfigReadable = true
                     result.cloudConfigKeys = parsed.keys.sorted()
-                    result.isSupervisedPlistClaim = boolValue(parsed["IsSupervised"])
+                    result.isSupervisedPlistClaim = Self.boolValue(parsed["IsSupervised"])
                     result.organizationName = parsed["OrganizationName"] as? String
 
                     // Write probe: rewrite exact bytes, verify
@@ -214,7 +214,7 @@ final class SupervisionDiagnostic: ObservableObject {
     // MARK: - Enable / Restore (experimental)
 
     /// Sets IsSupervised (+ minimal Nugget-compatible keys). Success only if MC reports true.
-    func enableSupervision(organization: String = SupervisionDiagnostic.organizationName) async -> ActionOutcome {
+    func enableSupervision(organization: String = "Ketamine Experimental") async -> ActionOutcome {
         guard !isBusy else {
             let o = ActionOutcome.failed("Busy.")
             lastAction = o
@@ -271,7 +271,7 @@ final class SupervisionDiagnostic: ObservableObject {
                   let verify = try? PropertyListSerialization.propertyList(
                     from: readback, options: [], format: nil
                   ) as? [String: Any],
-                  boolValue(verify["IsSupervised"]) == true
+                  Self.boolValue(verify["IsSupervised"]) == true
             else {
                 try? original.write(to: url, options: [])
                 let o = ActionOutcome.failed("Write verify failed — original restored.")
