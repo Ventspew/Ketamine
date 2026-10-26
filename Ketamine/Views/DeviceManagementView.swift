@@ -9,10 +9,14 @@ struct DeviceManagementView: View {
     @State private var showActionAlert = false
     @State private var actionAlertTitle = ""
     @State private var actionAlertBody = ""
-    @State private var showDiagnostics = false
-    @State private var showOnDeviceLog = false
+    @State private var showResearchLog = false
+    @State private var showFsLog = false
     @State private var busyMessage = "Working…"
     @State private var didAutoRun = false
+
+    private var a: OnDeviceSupervisionManager.CapabilityAssessment {
+        onDevice.report.assessment
+    }
 
     var body: some View {
         ZStack {
@@ -20,15 +24,16 @@ struct DeviceManagementView: View {
                 VStack(alignment: .leading, spacing: 28) {
                     header
                     if diagnostic.last.ranAt != nil {
-                        statusCard
-                        onDeviceSection
-                        configuratorFallback
-                        verifyButton
-                        diagnosticsDisclosure
+                        supervisionSummary
+                        capabilityGrid
+                        enrollmentOptions
+                        actions
+                        researchLog
+                        fsLog
                     } else {
                         placeholder
                     }
-                    runButton
+                    reRunButton
                 }
                 .padding(Theme.pagePadding)
                 .padding(.bottom, 24)
@@ -53,20 +58,20 @@ struct DeviceManagementView: View {
             }
         } message: {
             Text(
-                "Supported Apple path: Configurator on a Mac erases and supervises the device. " +
-                "Back up first. Then return here and Verify Supervision."
+                "This erases the iPhone. Back up first. After Prepare → Supervise " +
+                "(and optional MDM), return here and Verify. Separate confirmation is required " +
+                "before you erase on the Mac."
             )
         }
-        .alert("Experimental: Enable On-Device Supervision?", isPresented: $showEnableConfirm) {
+        .alert("Enable On-Device Supervision?", isPresented: $showEnableConfirm) {
             Button("Cancel", role: .cancel) {}
             Button("Enable", role: .destructive) {
                 Task { await runEnable() }
             }
         } message: {
             Text(
-                "Only runs if a verified supported activation mechanism exists. " +
-                "Success requires ManagedConfiguration isSupervised=true. " +
-                "Does not forge CloudConfiguration via BadQuery."
+                "Only if a supported in-app activator exists. Success requires MC isSupervised=true. " +
+                "Does not forge CloudConfiguration."
             )
         }
         .alert(actionAlertTitle, isPresented: $showActionAlert) {
@@ -82,12 +87,9 @@ struct DeviceManagementView: View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Device Management")
                 .font(.largeTitle.weight(.semibold))
-            Text(
-                "Research into on-device supervision plus Configurator fallback. " +
-                "MC isSupervised is the only success signal."
-            )
-            .font(.subheadline)
-            .foregroundStyle(.secondary)
+            Text("Capability assessment for genuine supervision. MC isSupervised is authoritative.")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
             Text("EXPERIMENTAL")
                 .font(.caption2.weight(.bold))
                 .tracking(0.8)
@@ -96,7 +98,7 @@ struct DeviceManagementView: View {
     }
 
     private var placeholder: some View {
-        Text("Running diagnostics…")
+        Text("Assessing supervision capabilities…")
             .font(.subheadline)
             .foregroundStyle(.secondary)
             .padding(18)
@@ -104,194 +106,171 @@ struct DeviceManagementView: View {
             .liquidGlass()
     }
 
-    private var statusCard: some View {
+    private var supervisionSummary: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            SectionHeader("On-Device Supervision")
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text("Current status")
+                        .font(.subheadline.weight(.medium))
+                    Spacer()
+                    Text(onDevice.report.supervisionStatusLabel)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(
+                            a.currentSupervision == .available ? Theme.affirmative : .primary
+                        )
+                }
+                if !a.missingPrerequisite.isEmpty {
+                    labeledBlock("Missing prerequisite", a.missingPrerequisite)
+                }
+                if !a.macFreeWorkflowNote.isEmpty {
+                    labeledBlock("Mac-free workflow", a.macFreeWorkflowNote)
+                }
+                if !a.closestSupportedWorkflow.isEmpty {
+                    labeledBlock("Closest supported alternative", a.closestSupportedWorkflow)
+                }
+                Text(onDevice.report.activationResult)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(18)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .liquidGlass()
+        }
+    }
+
+    private var capabilityGrid: some View {
         VStack(alignment: .leading, spacing: 12) {
-            SectionHeader("Status")
+            SectionHeader("Capability assessment")
             VStack(spacing: 0) {
-                statusRow("Filesystem access", diagnostic.last.filesystemAccessStatus)
+                capRow("Filesystem access", a.filesystemAccess)
                 Divider().padding(.leading, 16)
-                statusRow("Configuration integrity", diagnostic.last.integrityStatus,
-                          detail: diagnostic.last.configurationIntegrityDetail)
+                capRow("Configuration integrity", a.configurationIntegrity)
                 Divider().padding(.leading, 16)
-                statusRow("Supervision (MC)", diagnostic.last.supervisionStatus,
-                          detail: diagnostic.last.mcProbeError,
-                          emphasize: diagnostic.last.mcIsSupervised == true)
+                capRow("ManagedConfiguration", a.managedConfiguration)
                 Divider().padding(.leading, 16)
-                statusRow("DelayOTA readiness", diagnostic.last.delayOTAStatus)
+                capRow("Supervision (MC)", a.currentSupervision)
+                Divider().padding(.leading, 16)
+                capRow("MDM enrollment", a.mdmEnrollment)
+                Divider().padding(.leading, 16)
+                capRow("ADE / ABM eligibility", a.adeEligibility)
+                Divider().padding(.leading, 16)
+                capRow("On-device activation (KetaMine)", a.onDeviceActivation)
+                Divider().padding(.leading, 16)
+                capRow("Mac-free + no erase", a.macFreeNoErase)
+                Divider().padding(.leading, 16)
+                capRow("DelayOTA prerequisites", a.delayOTAPrerequisites)
             }
             .padding(.horizontal, 16)
             .liquidGlass()
         }
     }
 
-    private var onDeviceSection: some View {
+    private var enrollmentOptions: some View {
         VStack(alignment: .leading, spacing: 12) {
-            SectionHeader("On-Device Supervision")
-            VStack(spacing: 0) {
-                statusRow("Filesystem access", onDevice.report.filesystemAccess)
-                Divider().padding(.leading, 16)
-                statusRow("Supervision eligibility", onDevice.report.eligibility)
-                Divider().padding(.leading, 16)
-                statusRow(
-                    "Activation mechanism",
-                    onDevice.report.availableMechanism.rawValue,
-                    detail: onDevice.report.missingRequirement
-                )
-                Divider().padding(.leading, 16)
-                statusRow(
-                    "ManagedConfiguration",
-                    onDevice.report.mcIsSupervised.map { $0 ? "supervised" : "not supervised" } ?? "—"
-                )
-                Divider().padding(.leading, 16)
-                statusRow("Activation result", shortActivationResult)
-                Divider().padding(.leading, 16)
-                statusRow("DelayOTA readiness", onDevice.report.delayOTAReadiness)
+            SectionHeader("Enrollment options")
+            VStack(alignment: .leading, spacing: 8) {
+                optionLine("ADE / Apple Business Manager", "Supervised at Setup — usually requires erase to re-run Setup")
+                optionLine("Apple Configurator (Mac)", "Supervise = erase (documented)")
+                optionLine("MDM profile / account-driven (iPhone)", "Enrollment without supervision")
+                optionLine("KetaMine BadQuery plist write", "Not used — does not authorize MC supervision")
             }
-            .padding(.horizontal, 16)
+            .padding(18)
+            .frame(maxWidth: .infinity, alignment: .leading)
             .liquidGlass()
+        }
+    }
 
+    private var actions: some View {
+        VStack(alignment: .leading, spacing: 12) {
             if onDevice.report.canEnable {
                 Button { showEnableConfirm = true } label: {
-                    actionRow(
-                        title: "Enable Supervision",
-                        detail: "Supported on-device mechanism verified",
-                        symbol: "lock.open",
-                        locked: false
-                    )
+                    actionRow("Enable Supervision", "Supported activator verified", "lock.open", locked: false)
                 }
                 .buttonStyle(.plain)
-                .disabled(diagnostic.isBusy || onDevice.isBusy)
             } else {
                 actionRow(
-                    title: "Enable Supervision",
-                    detail: enableLockedDetail,
-                    symbol: "lock.fill",
+                    "Enable Supervision",
+                    "Locked — \(shortMissing)",
+                    "lock.fill",
                     locked: true
                 )
             }
 
-            Button {
-                withAnimation { showOnDeviceLog.toggle() }
-            } label: {
-                HStack {
-                    Text("On-device research log")
-                        .font(.caption.weight(.semibold))
-                    Spacer()
-                    Image(systemName: showOnDeviceLog ? "chevron.up" : "chevron.down")
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                }
+            Button { showConfiguratorConfirm = true } label: {
+                actionRow(
+                    "Apple Configurator (Mac)",
+                    "REQUIRES_ERASE — documented Supervise path",
+                    "laptopcomputer.and.iphone",
+                    locked: false
+                )
             }
             .buttonStyle(.plain)
 
-            if showOnDeviceLog {
-                Text(onDevice.report.log.joined(separator: "\n"))
-                    .font(.caption2.monospaced())
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
-                    .padding(14)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .liquidGlass()
+            Button {
+                Task { await refreshAll(busy: "Verifying supervision") }
+            } label: {
+                actionRow(
+                    "Verify Supervision",
+                    "Re-read MC isSupervised (+ full assessment)",
+                    "checkmark.shield",
+                    locked: false
+                )
             }
+            .buttonStyle(.plain)
+            .disabled(diagnostic.isBusy || onDevice.isBusy)
 
             Text(
-                "After any future successful activation: force-quit and reopen KetaMine to confirm MC " +
-                "still reports supervised; then reboot and Verify again. DelayOTA is separate."
+                "After Configurator/ADE: Verify → force-quit KetaMine → reopen → Verify. " +
+                "Then reboot and Verify again. DelayOTA stays separate from supervision."
             )
             .font(.caption2)
             .foregroundStyle(.tertiary)
         }
     }
 
-    private var enableLockedDetail: String {
-        if let missing = onDevice.report.missingRequirement, !missing.isEmpty {
-            // Keep button subtitle short; full text is in Activation mechanism detail.
-            return "Locked — no supported on-device mechanism"
-        }
-        return "Locked"
+    private var shortMissing: String {
+        let s = a.missingPrerequisite
+        if s.isEmpty { return "no supported activator" }
+        if s.count <= 56 { return s }
+        return String(s.prefix(53)) + "…"
     }
 
-    private var shortActivationResult: String {
-        let raw = onDevice.report.activationResult
-        if raw.count <= 48 { return raw }
-        return String(raw.prefix(45)) + "…"
-    }
-
-    private var configuratorFallback: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            SectionHeader("Supported fallback")
-            Text(
-                "Apple Configurator on a Mac remains the supported way to supervise without ADE. " +
-                "It erases the device."
-            )
-            .font(.caption)
-            .foregroundStyle(.secondary)
-
-            Button { showConfiguratorConfirm = true } label: {
-                actionRow(
-                    title: "Apple Configurator guide",
-                    detail: "Erase + Supervise on Mac, then Verify here",
-                    symbol: "laptopcomputer.and.iphone",
-                    locked: false
-                )
-            }
-            .buttonStyle(.plain)
-        }
-    }
-
-    private var verifyButton: some View {
-        Button {
-            Task { await refreshAll(busy: "Verifying supervision") }
-        } label: {
-            actionRow(
-                title: "Verify Supervision",
-                detail: "Re-read ManagedConfiguration isSupervised",
-                symbol: "checkmark.shield",
-                locked: false
-            )
-        }
-        .buttonStyle(.plain)
-        .disabled(diagnostic.isBusy || onDevice.isBusy)
-    }
-
-    private var diagnosticsDisclosure: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Button {
-                withAnimation { showDiagnostics.toggle() }
-            } label: {
-                HStack {
-                    Text("Filesystem diagnostic log")
-                        .font(.subheadline.weight(.semibold))
-                    Spacer()
-                    Image(systemName: showDiagnostics ? "chevron.up" : "chevron.down")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                }
-            }
-            .buttonStyle(.plain)
-
-            if showDiagnostics {
-                VStack(alignment: .leading, spacing: 8) {
-                    if let sha = diagnostic.last.cloudConfigSHA256 {
-                        Text("SHA-256: \(sha)")
-                            .font(.caption2.monospaced())
-                            .textSelection(.enabled)
-                    }
-                    Text(diagnostic.last.fsOperationLog.joined(separator: "\n"))
-                        .font(.caption2.monospaced())
-                        .foregroundStyle(.secondary)
+    private var researchLog: some View {
+        disclosure(title: "Technical research log", isOpen: $showResearchLog) {
+            VStack(alignment: .leading, spacing: 8) {
+                ForEach(a.conclusionLines, id: \.self) { line in
+                    Text("• \(line)")
+                        .font(.caption2)
                         .textSelection(.enabled)
                 }
-                .padding(14)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .liquidGlass()
+                Text(onDevice.report.log.joined(separator: "\n"))
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
             }
         }
     }
 
-    private var runButton: some View {
+    private var fsLog: some View {
+        disclosure(title: "Filesystem diagnostic log", isOpen: $showFsLog) {
+            VStack(alignment: .leading, spacing: 6) {
+                if let sha = diagnostic.last.cloudConfigSHA256 {
+                    Text("SHA-256: \(sha)")
+                        .font(.caption2.monospaced())
+                        .textSelection(.enabled)
+                }
+                Text(diagnostic.last.fsOperationLog.joined(separator: "\n"))
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
+        }
+    }
+
+    private var reRunButton: some View {
         ActionButton(
-            title: "Re-run diagnostics",
+            title: "Re-run assessment",
             systemImage: "stethoscope",
             isBusy: diagnostic.isBusy || onDevice.isBusy
         ) {
@@ -299,58 +278,65 @@ struct DeviceManagementView: View {
         }
     }
 
-    // MARK: - Actions
+    // MARK: - Helpers
 
-    private func refreshAll(busy: String = "Running diagnostics") async {
+    private func refreshAll(busy: String = "Running assessment") async {
         busyMessage = busy
         await diagnostic.run()
         await onDevice.evaluate(using: diagnostic.last)
     }
 
     private func runEnable() async {
-        busyMessage = "Attempting activation"
+        busyMessage = "Activation"
         let outcome = await onDevice.enableSupervisionConfirmed()
-        await diagnostic.run()
-        await onDevice.evaluate(using: diagnostic.last)
-        actionAlertTitle = outcome.isSuccess ? "Supervision active (MC)" : "Activation result"
+        await refreshAll(busy: "Verifying")
+        actionAlertTitle = outcome.isSuccess ? "SUPERVISED (MC)" : "Result"
         actionAlertBody = outcome.message
         showActionAlert = true
     }
 
-    // MARK: - Rows
-
-    private func statusRow(
-        _ title: String,
-        _ value: String,
-        detail: String? = nil,
-        emphasize: Bool = false
-    ) -> some View {
+    private func labeledBlock(_ title: String, _ body: String) -> some View {
         VStack(alignment: .leading, spacing: 4) {
-            HStack(alignment: .firstTextBaseline) {
-                Text(title).font(.subheadline.weight(.medium))
-                Spacer(minLength: 12)
-                Text(value)
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(emphasize ? Theme.affirmative : .primary)
-                    .multilineTextAlignment(.trailing)
-            }
-            if let detail, !detail.isEmpty {
-                Text(detail)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
-            }
+            Text(title).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+            Text(body).font(.caption).textSelection(.enabled)
+        }
+    }
+
+    private func optionLine(_ title: String, _ detail: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title).font(.subheadline.weight(.semibold))
+            Text(detail).font(.caption).foregroundStyle(.secondary)
+        }
+        .padding(.vertical, 4)
+    }
+
+    private func capRow(_ title: String, _ state: OnDeviceSupervisionManager.CapState) -> some View {
+        HStack(alignment: .firstTextBaseline) {
+            Text(title).font(.subheadline.weight(.medium))
+            Spacer()
+            Text(state.rawValue)
+                .font(.caption.weight(.bold).monospaced())
+                .foregroundStyle(capColor(state))
         }
         .padding(.vertical, 12)
     }
 
-    private func actionRow(title: String, detail: String, symbol: String, locked: Bool) -> some View {
+    private func capColor(_ state: OnDeviceSupervisionManager.CapState) -> Color {
+        switch state {
+        case .available: return Theme.affirmative
+        case .unavailable: return .secondary
+        case .requiresExternalSetup, .requiresErase: return Theme.caution
+        case .unknown: return .secondary
+        }
+    }
+
+    private func actionRow(_ title: String, _ detail: String, _ symbol: String, locked: Bool) -> some View {
         HStack(spacing: 12) {
             Image(systemName: symbol)
                 .foregroundStyle(locked ? .secondary : Theme.accent)
                 .frame(width: 24)
             VStack(alignment: .leading, spacing: 3) {
-                Text(title).font(.body.weight(.semibold)).foregroundStyle(.primary)
+                Text(title).font(.body.weight(.semibold))
                 Text(detail).font(.caption).foregroundStyle(.secondary)
             }
             Spacer()
@@ -358,5 +344,32 @@ struct DeviceManagementView: View {
         .padding(18)
         .liquidGlass()
         .opacity(locked ? 0.72 : 1)
+    }
+
+    private func disclosure<Content: View>(
+        title: String,
+        isOpen: Binding<Bool>,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Button {
+                withAnimation { isOpen.wrappedValue.toggle() }
+            } label: {
+                HStack {
+                    Text(title).font(.subheadline.weight(.semibold))
+                    Spacer()
+                    Image(systemName: isOpen.wrappedValue ? "chevron.up" : "chevron.down")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .buttonStyle(.plain)
+            if isOpen.wrappedValue {
+                content()
+                    .padding(14)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .liquidGlass()
+            }
+        }
     }
 }

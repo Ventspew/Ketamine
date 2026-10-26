@@ -1,30 +1,39 @@
 import Foundation
 import ObjectiveC
 
-/// Experimental research into on-device supervision activation without Configurator.
+/// Deep research + capability assessment for genuine on-device supervision.
 ///
-/// Genuine supervision (ManagedConfiguration `isSupervised == true`) is issued by
-/// Apple during ADE/Setup or Apple Configurator Prepare — not by rewriting
-/// CloudConfigurationDetails via sandbox escape.
+/// Apple's documented supervision paths (deployment guide):
+/// - Automated Device Enrollment (ADE/ABM): supervised at Setup Assistant — typically
+///   requires the device to go through setup (erase if already configured).
+/// - Apple Configurator for Mac Prepare → Supervise: **erases** the device.
+/// - Profile-based / account-driven Device Enrollment on iPhone: MDM **without**
+///   supervision (iOS). Account-driven User Enrollment: never supervised.
 ///
-/// This manager:
-/// - Reuses BadQuery filesystem diagnostics (read / writable-fd proof only)
-/// - Probes ManagedConfiguration / related private classes for activation entry points
-/// - Refuses exploit mutation of protected supervision records
-/// - Enables activation only if a supported, non-exploit mechanism is detected
+/// There is **no** documented Mac-free, erase-free transition from unsupervised →
+/// supervised for an already-configured iPhone. Writable CloudConfigurationDetails
+/// via BadQuery is filesystem access only and must not forge IsSupervised.
 @MainActor
 final class OnDeviceSupervisionManager: ObservableObject {
 
     static let shared = OnDeviceSupervisionManager()
 
+    // MARK: - Explicit capability states
+
+    enum CapState: String, Equatable {
+        case available = "AVAILABLE"
+        case unavailable = "UNAVAILABLE"
+        case requiresExternalSetup = "REQUIRES_EXTERNAL_SETUP"
+        case requiresErase = "REQUIRES_ERASE"
+        case unknown = "UNKNOWN"
+    }
+
     enum ActivationMechanism: String, Equatable {
         case none = "none"
-        /// Device already supervised — nothing to activate.
         case alreadySupervised = "already-supervised"
-        /// Documented Apple path (Mac + erase). Not on-device.
-        case appleConfigurator = "apple-configurator"
-        /// ADE/ABM identity applied at Setup Assistant — not recoverable mid-lifecycle here.
-        case adeSetupAssistant = "ade-setup-assistant"
+        case appleConfiguratorMac = "apple-configurator-mac"
+        case adeSetupAssistant = "ade-abm-setup-assistant"
+        case mdmEnrollmentUnsupervised = "mdm-enrollment-not-supervised"
     }
 
     enum ActivationOutcome: Equatable {
@@ -34,35 +43,48 @@ final class OnDeviceSupervisionManager: ObservableObject {
         case notApplicable(String)
     }
 
+    /// Structured assessment shown in UI and research log.
+    struct CapabilityAssessment: Equatable {
+        var filesystemAccess: CapState = .unknown
+        var configurationIntegrity: CapState = .unknown
+        var managedConfiguration: CapState = .unknown
+        var currentSupervision: CapState = .unknown
+        var mdmEnrollment: CapState = .unknown
+        var adeEligibility: CapState = .unknown
+        var onDeviceActivation: CapState = .unknown
+        var macFreeNoErase: CapState = .unknown
+        var delayOTAPrerequisites: CapState = .unknown
+
+        var mcIsSupervised: Bool?
+        var mdmEnrolledHint: Bool?
+        var plistIsSupervisedClaim: Bool?
+        var writableFdProven: Bool = false
+
+        var availableMechanisms: [ActivationMechanism] = []
+        var missingPrerequisite: String = ""
+        var closestSupportedWorkflow: String = ""
+        var macFreeWorkflowNote: String = ""
+        var conclusionLines: [String] = []
+    }
+
     struct Report: Equatable {
         var ranAt: Date?
-        var filesystemAccess: String = "—"
-        var writableFdProven: Bool = false
-        var configurationIntegrityOK: Bool = false
-        var plistIsSupervisedClaim: Bool? = nil
-        var mcIsSupervised: Bool? = nil
-        var mcSupported: Bool = false
-        var mcError: String?
-
-        var eligibility: String = "Unknown"
-        var availableMechanism: ActivationMechanism = .none
-        var missingRequirement: String?
+        var assessment = CapabilityAssessment()
         var activationResult: String = "Not attempted"
-        var delayOTAReadiness: String = "Not ready"
-
         var probedClasses: [String] = []
         var probedSelectors: [String] = []
         var log: [String] = []
 
-        var canEnable: Bool {
-            // Only if we have a real on-device mechanism — currently never for unsigned apps.
-            // alreadySupervised does not need Enable.
-            false
-        }
+        /// Enable only if a documented activator is executable in-process (never true today).
+        var canEnable: Bool { false }
 
-        var summary: String {
-            "mechanism=\(availableMechanism.rawValue); MC=\(mcIsSupervised.map { $0 ? "true" : "false" } ?? "?"); " +
-            (missingRequirement ?? eligibility)
+        var supervisionStatusLabel: String {
+            switch assessment.currentSupervision {
+            case .available: return "SUPERVISED (MC)"
+            case .unavailable: return "Not supervised (MC)"
+            case .unknown: return "UNKNOWN"
+            default: return assessment.currentSupervision.rawValue
+            }
         }
     }
 
@@ -84,65 +106,145 @@ final class OnDeviceSupervisionManager: ObservableObject {
         var log: [String] = []
         func line(_ s: String) { log.append(s) }
 
-        r.filesystemAccess = diagnostic.filesystemAccessStatus
-        r.writableFdProven = diagnostic.writableFdProven
-        r.configurationIntegrityOK = diagnostic.configurationIntegrityOK
-        r.plistIsSupervisedClaim = diagnostic.isSupervisedPlistClaim
-        r.mcIsSupervised = diagnostic.mcIsSupervised
-        r.mcSupported = diagnostic.mcProbeSupported
-        r.mcError = diagnostic.mcProbeError
+        var a = CapabilityAssessment()
+        a.writableFdProven = diagnostic.writableFdProven
+        a.plistIsSupervisedClaim = diagnostic.isSupervisedPlistClaim
+        a.mcIsSupervised = diagnostic.mcIsSupervised
 
-        line("fs=\(r.filesystemAccess) writableFd=\(r.writableFdProven) integrity=\(r.configurationIntegrityOK)")
-        line("plist IsSupervised claim=\(r.plistIsSupervisedClaim.map(String.init(describing:)) ?? "nil")")
-        line("MC isSupervised=\(r.mcIsSupervised.map(String.init(describing:)) ?? "nil")")
+        // --- Filesystem ---
+        if !diagnostic.badQueryAvailable {
+            a.filesystemAccess = .unavailable
+        } else if diagnostic.writableFdProven {
+            a.filesystemAccess = .available
+        } else if diagnostic.configProfilesDirReachable {
+            a.filesystemAccess = .unavailable
+        } else {
+            a.filesystemAccess = .unknown
+        }
+        line("cap.filesystemAccess=\(a.filesystemAccess.rawValue) writableFd=\(diagnostic.writableFdProven)")
 
-        // Architecture notes (research, not activation)
-        line("arch: CloudConfigurationDetails IsSupervised is a claim file; MC isSupervised is authoritative")
-        line("arch: ADE cloud config is applied by Setup/manageddaemons with Apple-signed identity — not by 3rd-party apps")
-        line("arch: BadQuery writable fd proves FS access only; writing IsSupervised≠MC supervision (forbidden here)")
+        // --- Integrity ---
+        if diagnostic.configurationIntegrityOK {
+            a.configurationIntegrity = .available
+        } else if diagnostic.cloudConfigReadable {
+            a.configurationIntegrity = .unknown
+        } else {
+            a.configurationIntegrity = .unavailable
+        }
+        line("cap.configurationIntegrity=\(a.configurationIntegrity.rawValue)")
 
+        // --- ManagedConfiguration framework ---
+        if diagnostic.mcProbeSupported {
+            a.managedConfiguration = .available
+        } else {
+            a.managedConfiguration = .unavailable
+        }
+        line("cap.managedConfiguration=\(a.managedConfiguration.rawValue)")
+
+        // --- Current supervision (MC only) ---
+        if let supervised = diagnostic.mcIsSupervised {
+            a.currentSupervision = supervised ? .available : .unavailable
+        } else {
+            a.currentSupervision = .unknown
+        }
+        line("cap.currentSupervision=\(a.currentSupervision.rawValue) mc=\(diagnostic.mcIsSupervised.map(String.init(describing:)) ?? "nil")")
+        line("note: plist IsSupervised claim=\(diagnostic.isSupervisedPlistClaim.map(String.init(describing:)) ?? "nil") is NOT authoritative")
+
+        // --- Probe private surfaces + MDM/DEP query getters ---
         let probe = Self.probeActivationSurfaces()
         r.probedClasses = probe.classes
         r.probedSelectors = probe.selectors
         log.append(contentsOf: probe.log)
-
-        if diagnostic.mcIsSupervised == true {
-            r.availableMechanism = .alreadySupervised
-            r.eligibility = "Device already supervised (MC)"
-            r.missingRequirement = nil
-            r.delayOTAReadiness =
-                "Supervision OK — DelayOTA still needs MDM deferral profile + Apple still signing target"
-            r.activationResult = "Already supervised"
-            line("verdict: already supervised")
+        a.mdmEnrolledHint = probe.mdmEnrolled
+        if let enrolled = probe.mdmEnrolled {
+            a.mdmEnrollment = enrolled ? .available : .unavailable
         } else {
-            // No supported on-device activation for an unsigned third-party app.
-            r.availableMechanism = .none
-            r.eligibility = "Not eligible for on-device activation from KetaMine"
-            r.missingRequirement =
-                "Missing Apple-signed supervision identity / Configurator or ADE enrollment. " +
-                "MCProfileConnection exposes isSupervised for query only; no public or privately " +
-                "callable unsupervised→supervised transition was found for this process. " +
-                "Filesystem write access to CloudConfigurationDetails is insufficient and must not " +
-                "be used to forge supervision."
-            r.delayOTAReadiness = "Not ready (device not supervised per MC)"
-            r.activationResult = "Disabled — no supported mechanism"
-            line("verdict: no on-device mechanism; missing=\(r.missingRequirement!)")
+            a.mdmEnrollment = .unknown
+        }
+        line("cap.mdmEnrollment=\(a.mdmEnrollment.rawValue) hint=\(probe.mdmEnrolled.map(String.init(describing:)) ?? "nil")")
 
-            // Document Configurator / ADE as external mechanisms (not activatable here)
-            if probe.hasQueryOnlySupervisionAPI {
-                line("note: supervision query API present; activation API absent for this sandbox/signing")
-            }
-            line("external: apple-configurator (erase) and ade-setup-assistant remain the supported paths")
-            _ = ActivationMechanism.appleConfigurator
-            _ = ActivationMechanism.adeSetupAssistant
+        if let dep = probe.depEnrolled {
+            a.adeEligibility = dep ? .requiresExternalSetup : .unavailable
+            line("cap.adeEligibility=\(a.adeEligibility.rawValue) isEnrolledInDEP=\(dep)")
+        } else {
+            // Cannot verify ABM assignment from this app without Apple/MDM server APIs.
+            a.adeEligibility = .unknown
+            line("cap.adeEligibility=UNKNOWN (DEP/ABM assignment not verifiable in-process)")
         }
 
+        // --- Architecture research log ---
+        line("arch: Reporter = MCProfileConnection.isSupervised; Activators = ADE Setup / Configurator Prepare")
+        line("arch: ADE (iOS 13+) auto-supervises at enrollment; needs ABM + Setup Assistant")
+        line("arch: Configurator for Mac Supervise erases device (Apple deployment guide)")
+        line("arch: Profile-based Device Enrollment on iPhone = MDM without supervision")
+        line("arch: Account-driven Device Enrollment on iPhone = not supervised; User Enrollment = not supervised")
+        line("arch: Apple Configurator for iPhone configures other devices — does not supervise this iPhone in place")
+        line("arch: No documented unsupervised→supervised path that preserves data without erase/re-setup")
+        line("arch: BadQuery writable fd ≠ supervision authorization; forging IsSupervised forbidden")
+
+        // --- On-device activation by KetaMine ---
+        if diagnostic.mcIsSupervised == true {
+            a.onDeviceActivation = .available
+            a.macFreeNoErase = .available
+            a.availableMechanisms = [.alreadySupervised]
+            a.missingPrerequisite = ""
+            a.closestSupportedWorkflow = "None required — already supervised."
+            a.macFreeWorkflowNote = "Already supervised; no Mac or erase needed."
+            a.conclusionLines = [
+                "Can become supervised without Mac? N/A (already supervised).",
+                "Without erase? N/A (already supervised).",
+                "Can KetaMine perform the transition? N/A.",
+                "Verified status: SUPERVISED (MC)."
+            ]
+            r.activationResult = "Already supervised"
+        } else {
+            a.onDeviceActivation = .unavailable
+            a.macFreeNoErase = .unavailable
+            a.availableMechanisms = [
+                .appleConfiguratorMac,
+                .adeSetupAssistant,
+                .mdmEnrollmentUnsupervised
+            ]
+            a.missingPrerequisite =
+                "Apple-signed supervision identity applied at ADE Setup Assistant or " +
+                "Configurator Prepare. This process has query-only MC APIs; no authorized " +
+                "unsupervised→supervised activator. MDM enrollment alone does not supervise iPhone."
+            a.closestSupportedWorkflow =
+                "Backup → Apple Configurator for Mac → Prepare → Supervise (erases) → " +
+                "optional MDM → restore backup if needed → Verify in KetaMine. " +
+                "Or: assign device in Apple Business Manager → erase → Setup Assistant ADE."
+            a.macFreeWorkflowNote =
+                "Mac-free ADE still requires the device in ABM and typically an erase to re-run Setup. " +
+                "No Mac-free, erase-free supervision transition exists for this already-configured iPhone."
+            a.conclusionLines = [
+                "Can this iPhone become genuinely supervised without a Mac? Only via ADE/ABM + Setup (usually after erase) — not via KetaMine.",
+                "Without erasing? No supported Apple path for unsupervised→supervised while keeping the current install.",
+                "Can KetaMine perform the transition? No.",
+                "Blocking prerequisite: \(a.missingPrerequisite)",
+                "Closest alternative: \(a.closestSupportedWorkflow)",
+                "Verified current status: Not supervised (MC isSupervised=false)."
+            ]
+            r.activationResult = "Disabled — no supported on-device mechanism"
+            line("verdict: onDeviceActivation=UNAVAILABLE macFreeNoErase=UNAVAILABLE")
+        }
+
+        // --- DelayOTA (separate) ---
+        if diagnostic.mcIsSupervised == true {
+            // Supervision necessary but not sufficient.
+            a.delayOTAPrerequisites = .requiresExternalSetup
+            line("cap.delayOTAPrerequisites=REQUIRES_EXTERNAL_SETUP (need MDM deferral profile + signed target)")
+        } else {
+            a.delayOTAPrerequisites = .unavailable
+            line("cap.delayOTAPrerequisites=UNAVAILABLE (supervision required first)")
+        }
+
+        a.assessmentCompleteNote(&log)
+        r.assessment = a
         r.log = log
         report = r
         lastOutcome = nil
     }
 
-    /// Explicit activation attempt. Refuses exploit-based plist mutation.
     func enableSupervisionConfirmed() async -> ActivationOutcome {
         guard !isBusy else {
             let o = ActivationOutcome.failed("Busy.")
@@ -150,66 +252,52 @@ final class OnDeviceSupervisionManager: ObservableObject {
             return o
         }
 
-        // Refresh MC first
         let mc = SupervisionDiagnostic.probeManagedConfigurationIsSupervised()
         if mc.supported, mc.value == true {
             let o = ActivationOutcome.notApplicable(
-                "Already supervised (ManagedConfiguration isSupervised=true). No activation needed."
+                "Already supervised (ManagedConfiguration isSupervised=true)."
             )
             lastOutcome = o
             report.activationResult = o.message
-            report.mcIsSupervised = true
+            report.assessment.mcIsSupervised = true
+            report.assessment.currentSupervision = .available
             return o
         }
 
-        if !report.canEnable {
-            let detail = report.missingRequirement
-                ?? "No supported on-device activation mechanism."
-            let o = ActivationOutcome.refused(
-                "Enable refused: \(detail) " +
-                "KetaMine will not mutate CloudConfigurationDetails.IsSupervised via BadQuery " +
-                "because that does not produce ManagedConfiguration-recognized supervision."
-            )
-            lastOutcome = o
-            report.activationResult = o.message
-            return o
-        }
-
-        // Placeholder for a future supported path — currently unreachable while canEnable == false.
-        let o = ActivationOutcome.failed(
-            "Internal error: canEnable true but no activator implemented."
+        let o = ActivationOutcome.refused(
+            "Enable refused: \(report.assessment.missingPrerequisite) " +
+            "KetaMine will not forge CloudConfigurationDetails.IsSupervised via BadQuery."
         )
         lastOutcome = o
         report.activationResult = o.message
         return o
     }
 
-    // MARK: - Private API surface probe (detection only)
+    // MARK: - Probes
 
     private struct ProbeResult {
         var classes: [String]
         var selectors: [String]
         var log: [String]
-        var hasQueryOnlySupervisionAPI: Bool
+        var mdmEnrolled: Bool?
+        var depEnrolled: Bool?
     }
 
-    /// Looks for classes/selectors related to supervision / cloud config / DEP.
-    /// Does not invoke mutating methods.
+    /// Detection + safe boolean getters only. Never invokes mutate selectors.
     private static func probeActivationSurfaces() -> ProbeResult {
         var classes: [String] = []
         var selectors: [String] = []
         var log: [String] = []
-        var hasQuery = false
+        var mdmEnrolled: Bool?
+        var depEnrolled: Bool?
 
         let classNames = [
             "MCProfileConnection",
             "MCInstaller",
             "MCCloudConfiguration",
-            "MCDeviceUploadSubmission",
             "DEPClient",
             "MDMClient",
-            "RMStore",
-            "ManagedConfigurationHelper"
+            "RMStore"
         ]
 
         for name in classNames {
@@ -219,51 +307,63 @@ final class OnDeviceSupervisionManager: ObservableObject {
             }
             classes.append(name)
             log.append("class \(name): present")
+        }
 
-            if name == "MCProfileConnection" {
-                let sharedSel = NSSelectorFromString("sharedConnection")
-                guard cls.responds(to: sharedSel),
-                      let unmanaged = cls.perform(sharedSel),
-                      let connection = unmanaged.takeUnretainedValue() as? NSObject else {
-                    log.append("MCProfileConnection.sharedConnection: unavailable")
-                    continue
-                }
+        guard let connectionClass = NSClassFromString("MCProfileConnection") as? NSObject.Type else {
+            return ProbeResult(classes: classes, selectors: selectors, log: log, mdmEnrolled: nil, depEnrolled: nil)
+        }
+        let sharedSel = NSSelectorFromString("sharedConnection")
+        guard connectionClass.responds(to: sharedSel),
+              let unmanaged = connectionClass.perform(sharedSel),
+              let connection = unmanaged.takeUnretainedValue() as? NSObject else {
+            log.append("MCProfileConnection.sharedConnection: unavailable")
+            return ProbeResult(classes: classes, selectors: selectors, log: log, mdmEnrolled: nil, depEnrolled: nil)
+        }
 
-                let querySelectors = [
-                    "isSupervised",
-                    "isSupervisedDevice",
-                    "cloudConfigurationDetails",
-                    "hasCloudConfiguration",
-                    "isProvisionallyEnrolled",
-                    "isEnrolledInDEP",
-                    "organizationName"
-                ]
-                let mutateSelectors = [
-                    "superviseDevice",
-                    "setSupervised:",
-                    "applyCloudConfiguration:",
-                    "installCloudConfiguration:",
-                    "migrateCloudConfiguration:",
-                    "acceptCloudConfiguration:"
-                ]
+        let querySelectors = [
+            "isSupervised",
+            "cloudConfigurationDetails",
+            "hasCloudConfiguration",
+            "isProvisionallyEnrolled",
+            "isEnrolledInDEP",
+            "isMDMProfileInstalled",
+            "isEnrolledViaMDM",
+            "hasMDMProfileInstalled",
+            "organizationName",
+            "deviceSupervisionIdentityCertificate"
+        ]
+        let mutateSelectors = [
+            "superviseDevice",
+            "setSupervised:",
+            "applyCloudConfiguration:",
+            "installCloudConfiguration:",
+            "migrateCloudConfiguration:",
+            "acceptCloudConfiguration:"
+        ]
 
-                for selName in querySelectors {
-                    let sel = NSSelectorFromString(selName)
-                    let ok = connection.responds(to: sel)
-                    log.append("selector \(selName): \(ok ? "responds" : "missing")")
-                    if ok {
-                        selectors.append(selName)
-                        if selName == "isSupervised" || selName == "isSupervisedDevice" {
-                            hasQuery = true
-                        }
-                    }
-                }
-                for selName in mutateSelectors {
-                    let sel = NSSelectorFromString(selName)
-                    let ok = connection.responds(to: sel)
-                    log.append("selector \(selName) (mutate): \(ok ? "responds — not invoked" : "missing")")
-                    if ok { selectors.append("mutate:\(selName)") }
-                }
+        for selName in querySelectors {
+            let sel = NSSelectorFromString(selName)
+            let ok = connection.responds(to: sel)
+            log.append("selector \(selName): \(ok ? "responds" : "missing")")
+            if ok { selectors.append(selName) }
+        }
+        for selName in mutateSelectors {
+            let sel = NSSelectorFromString(selName)
+            let ok = connection.responds(to: sel)
+            log.append("selector \(selName) (mutate): \(ok ? "responds — NOT invoked" : "missing")")
+            if ok { selectors.append("mutate:\(selName)") }
+        }
+
+        // Safe bool getters where present
+        mdmEnrolled = boolGetter(connection, names: [
+            "isMDMProfileInstalled", "isEnrolledViaMDM", "hasMDMProfileInstalled"
+        ], log: &log)
+        depEnrolled = boolGetter(connection, names: ["isEnrolledInDEP"], log: &log)
+
+        if let detailsSel = optionalPerformDict(connection, "cloudConfigurationDetails") {
+            log.append("cloudConfigurationDetails keys=\(detailsSel.keys.sorted().joined(separator: ","))")
+            if let claim = detailsSel["IsSupervised"] as? Bool {
+                log.append("cloudConfigurationDetails.IsSupervised claim=\(claim) (non-authoritative)")
             }
         }
 
@@ -271,8 +371,36 @@ final class OnDeviceSupervisionManager: ObservableObject {
             classes: classes,
             selectors: selectors,
             log: log,
-            hasQueryOnlySupervisionAPI: hasQuery
+            mdmEnrolled: mdmEnrolled,
+            depEnrolled: depEnrolled
         )
+    }
+
+    private static func boolGetter(_ object: NSObject, names: [String], log: inout [String]) -> Bool? {
+        for name in names {
+            let sel = NSSelectorFromString(name)
+            guard object.responds(to: sel),
+                  let method = class_getInstanceMethod(type(of: object), sel) else { continue }
+            typealias BoolFn = @convention(c) (AnyObject, Selector) -> Bool
+            let fn = unsafeBitCast(method_getImplementation(method), to: BoolFn.self)
+            let value = fn(object, sel)
+            log.append("call \(name) → \(value)")
+            return value
+        }
+        return nil
+    }
+
+    private static func optionalPerformDict(_ object: NSObject, _ selName: String) -> [String: Any]? {
+        let sel = NSSelectorFromString(selName)
+        guard object.responds(to: sel),
+              let unmanaged = object.perform(sel) else { return nil }
+        return unmanaged.takeUnretainedValue() as? [String: Any]
+    }
+}
+
+private extension OnDeviceSupervisionManager.CapabilityAssessment {
+    mutating func assessmentCompleteNote(_ log: inout [String]) {
+        log.append("assessment.complete filesystem=\(filesystemAccess.rawValue) integrity=\(configurationIntegrity.rawValue) mc=\(managedConfiguration.rawValue) supervision=\(currentSupervision.rawValue) mdm=\(mdmEnrollment.rawValue) ade=\(adeEligibility.rawValue) onDevice=\(onDeviceActivation.rawValue) macFreeNoErase=\(macFreeNoErase.rawValue) delayOTA=\(delayOTAPrerequisites.rawValue)")
     }
 }
 
