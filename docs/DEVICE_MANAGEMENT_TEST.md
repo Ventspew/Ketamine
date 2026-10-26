@@ -1,13 +1,15 @@
-# Device Management
+# Device Management / On-Device Supervision
 
-## Integrity false-negative (fixed in 1.4.0)
+## Finding (iOS 27 beta 3 research device)
 
-Prior builds could report **INTEGRITY FAIL** after a successful identical persist because a later read without a live BadQuery token failed / disagreed, then cleared `writeProven`. Diagnostics are now **read-only** on the live plist and compare **SHA-256** across two token-held reads. Recheck failure ≠ corruption.
+Filesystem: BadQuery file-token can open `CloudConfigurationDetails.plist` O_WRONLY; identical-byte write previously worked. That proves **FS access only**.
 
-## Genuine supervision
+ManagedConfiguration `isSupervised` remains the authority for genuine supervision.
 
-KetaMine does **not** rewrite `IsSupervised` in CloudConfigurationDetails to claim supervision.
+KetaMine **does not** activate supervision by rewriting `IsSupervised` via BadQuery (cosmetic / non-MC).
 
-Supported path: **Apple Configurator → Prepare → Supervise** (erases device), then optional MDM, then **Verify Supervision** (ManagedConfiguration `isSupervised`).
+`OnDeviceSupervisionManager` probes MC / related classes for activation selectors. On this signing/sandbox, only **query** APIs are usable; no unsupervised→supervised transition is available to the app. **Enable Supervision** stays locked with the missing requirement stated in-app.
 
-DelayOTA additionally needs a deferral MDM profile and a still-signed target build.
+Supported path without ADE: Apple Configurator (erase) → Verify in app.
+
+DelayOTA = supervision (MC) + MDM deferral profile + Apple still signing the target — reported separately.

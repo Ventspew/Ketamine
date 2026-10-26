@@ -21,7 +21,7 @@ struct SystemHubView: View {
                         NavigationLink { DeviceManagementView() } label: {
                             HubToolCard(
                                 title: "Device Management",
-                                detail: "Supervision status + Apple Configurator workflow",
+                                detail: "On-device supervision research + Configurator fallback",
                                 symbol: "lock.shield"
                             )
                         }
