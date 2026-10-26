@@ -9,6 +9,7 @@ struct DeviceManagementView: View {
     @State private var actionAlertTitle = ""
     @State private var actionAlertBody = ""
     @State private var busyMessage = "Working…"
+    @State private var didAutoRun = false
 
     var body: some View {
         ZStack {
@@ -36,6 +37,12 @@ struct DeviceManagementView: View {
         }
         .navigationTitle("Device Management")
         .navigationBarTitleDisplayMode(.inline)
+        .task {
+            guard !didAutoRun else { return }
+            didAutoRun = true
+            busyMessage = "Running diagnostics"
+            await diagnostic.run()
+        }
         .alert("Experimental: Enable Supervision?", isPresented: $showEnableConfirm) {
             Button("Cancel", role: .cancel) {}
             Button("Enable", role: .destructive) {
@@ -70,8 +77,8 @@ struct DeviceManagementView: View {
             Text("Device Management")
                 .font(.largeTitle.weight(.semibold))
             Text(
-                "Diagnostics for configurationprofiles access, write capability, and " +
-                "experimental CloudConfiguration supervision. Labelled experimental."
+                "Auto-runs non-destructive write probes on open. Enable Supervision is " +
+                "experimental and requires confirmation."
             )
             .font(.subheadline)
             .foregroundStyle(.secondary)
@@ -94,7 +101,7 @@ struct DeviceManagementView: View {
     }
 
     private var placeholder: some View {
-        Text("Run diagnostics first (includes non-destructive write probes).")
+        Text("Diagnostics run automatically when this screen opens…")
             .font(.subheadline)
             .foregroundStyle(.secondary)
             .padding(18)
@@ -153,9 +160,15 @@ struct DeviceManagementView: View {
                 )
                 Divider().padding(.leading, 16)
                 row(
-                    "CloudConfiguration write (identical rewrite)",
+                    "CloudConfiguration file info",
+                    text: diagnostic.last.cloudConfigFileInfo != nil ? "see detail" : "—",
+                    detail: diagnostic.last.cloudConfigFileInfo
+                )
+                Divider().padding(.leading, 16)
+                row(
+                    "CloudConfiguration write",
                     bool: diagnostic.last.cloudConfigWriteAllowed,
-                    detail: diagnostic.last.cloudConfigWriteError
+                    detail: writeDetail
                 )
                 Divider().padding(.leading, 16)
                 row(
@@ -184,6 +197,16 @@ struct DeviceManagementView: View {
         }
     }
 
+    private var writeDetail: String? {
+        if diagnostic.last.cloudConfigWriteAllowed {
+            return "method: \(diagnostic.last.cloudConfigWriteMethod ?? "?")"
+        }
+        if let err = diagnostic.last.cloudConfigWriteError, !err.isEmpty {
+            return err
+        }
+        return nil
+    }
+
     private var actions: some View {
         VStack(alignment: .leading, spacing: 12) {
             SectionHeader("Experimental actions")
@@ -202,7 +225,7 @@ struct DeviceManagementView: View {
             } else {
                 actionCard(
                     title: "Enable Supervision",
-                    detail: "Locked until write probes pass — re-run diagnostics",
+                    detail: lockedEnableDetail,
                     symbol: "lock.fill",
                     locked: true
                 )
@@ -242,6 +265,13 @@ struct DeviceManagementView: View {
                 )
             }
         }
+    }
+
+    private var lockedEnableDetail: String {
+        if let err = diagnostic.last.cloudConfigWriteError, !err.isEmpty {
+            return "Locked — \(err)"
+        }
+        return "Locked until a CloudConfiguration write strategy succeeds"
     }
 
     private var delayOTANote: some View {
@@ -305,7 +335,10 @@ struct DeviceManagementView: View {
                     .foregroundStyle(color(for: affirmative, text: text))
             }
             if let detail, !detail.isEmpty {
-                Text(detail).font(.caption2).foregroundStyle(.secondary)
+                Text(detail)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
             }
         }
         .padding(.vertical, 12)

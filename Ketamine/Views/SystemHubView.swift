@@ -21,7 +21,7 @@ struct SystemHubView: View {
                         NavigationLink { DeviceManagementView() } label: {
                             HubToolCard(
                                 title: "Device Management",
-                                detail: "Read-only supervision / configurationprofiles diagnostics",
+                                detail: "Write probes + experimental Enable Supervision",
                                 symbol: "lock.shield"
                             )
                         }
