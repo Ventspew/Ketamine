@@ -198,13 +198,12 @@ final class SupervisionDiagnostic: ObservableObject {
             }
             return (false, nil, "isSupervised selector missing on MCProfileConnection.")
         }
-        // BOOL returns via perform are boxed as NSNumber on modern runtimes when using
-        // NSInvocation; perform(_:) with BOOL is unreliable. Use methodIMP.
+        // BOOL via perform(_:) is unreliable; call IMP directly.
         typealias BoolGetter = @convention(c) (AnyObject, Selector) -> Bool
-        guard let method = class_getInstanceMethod(type(of: connection), supervisedSel),
-              let imp = method_getImplementation(method) else {
-            return (false, nil, "Could not get IMP for isSupervised.")
+        guard let method = class_getInstanceMethod(type(of: connection), supervisedSel) else {
+            return (false, nil, "Could not get Method for isSupervised.")
         }
+        let imp = method_getImplementation(method)
         let fn = unsafeBitCast(imp, to: BoolGetter.self)
         let value = fn(connection, supervisedSel)
         return (true, value, nil)
@@ -212,7 +211,7 @@ final class SupervisionDiagnostic: ObservableObject {
 
     private func describe(_ error: Error) -> String {
         if let bq = error as? BadQueryError {
-            return bq.localizedDescription ?? String(describing: bq)
+            return bq.errorDescription ?? String(describing: bq)
         }
         let ns = error as NSError
         return "\(ns.domain) (\(ns.code)): \(ns.localizedDescription)"
