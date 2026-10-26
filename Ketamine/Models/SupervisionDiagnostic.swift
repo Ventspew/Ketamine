@@ -319,7 +319,7 @@ final class SupervisionDiagnostic: ObservableObject {
             lastAction = o
             return o
         }
-        guard last.configProfilesDirReachable || last.badQueryAvailable else {
+        if !last.configProfilesDirReachable {
             await run()
             guard last.configProfilesDirReachable else {
                 let o = ActionOutcome.failed("configurationprofiles not reachable.")
