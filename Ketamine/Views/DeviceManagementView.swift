@@ -3,11 +3,8 @@ import UIKit
 
 struct DeviceManagementView: View {
     @ObservedObject private var diagnostic = SupervisionDiagnostic.shared
-    @State private var showEnableConfirm = false
-    @State private var showRestoreConfirm = false
-    @State private var showActionAlert = false
-    @State private var actionAlertTitle = ""
-    @State private var actionAlertBody = ""
+    @State private var showConfiguratorConfirm = false
+    @State private var showDiagnostics = false
     @State private var busyMessage = "Working…"
     @State private var didAutoRun = false
 
@@ -16,15 +13,15 @@ struct DeviceManagementView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 28) {
                     header
-                    runButton
                     if diagnostic.last.ranAt != nil {
-                        summaryCard
-                        results
-                        actions
-                        delayOTANote
+                        statusCard
+                        supervisionWorkflow
+                        verifyButton
+                        diagnosticsDisclosure
                     } else {
                         placeholder
                     }
+                    runButton
                 }
                 .padding(Theme.pagePadding)
                 .padding(.bottom, 24)
@@ -43,30 +40,17 @@ struct DeviceManagementView: View {
             busyMessage = "Running diagnostics"
             await diagnostic.run()
         }
-        .alert("Experimental: Enable Supervision?", isPresented: $showEnableConfirm) {
+        .alert("Supervise with Apple Configurator?", isPresented: $showConfiguratorConfirm) {
             Button("Cancel", role: .cancel) {}
-            Button("Enable", role: .destructive) {
-                Task { await runEnable() }
+            Button("Open Apple guide", role: .destructive) {
+                UIApplication.shared.open(SupervisionDiagnostic.configuratorHelpURL)
             }
         } message: {
             Text(
-                "This writes IsSupervised and a few CloudConfigurationDetails keys only. " +
-                "A local backup is kept for Restore. Success requires ManagedConfiguration " +
-                "to report supervised — not just the plist. This may have no effect on DelayOTA."
+                "Genuine supervision requires Apple Configurator on a Mac and erases this iPhone. " +
+                "Back up first. After Prepare → Supervise (and optional MDM), return here and tap " +
+                "Verify Supervision. KetaMine does not rewrite system plists to fake supervision."
             )
-        }
-        .alert("Restore original CloudConfiguration?", isPresented: $showRestoreConfirm) {
-            Button("Cancel", role: .cancel) {}
-            Button("Restore", role: .destructive) {
-                Task { await runRestore() }
-            }
-        } message: {
-            Text("Replaces CloudConfigurationDetails.plist with the copy saved before Enable.")
-        }
-        .alert(actionAlertTitle, isPresented: $showActionAlert) {
-            Button("OK", role: .cancel) {}
-        } message: {
-            Text(actionAlertBody)
         }
     }
 
@@ -77,21 +61,149 @@ struct DeviceManagementView: View {
             Text("Device Management")
                 .font(.largeTitle.weight(.semibold))
             Text(
-                "Investigates file/parent BadQuery tokens vs dir-token EPERM. " +
-                "Enable unlocks only if identical-byte persist is proven (not open alone). Experimental."
+                "Checks filesystem access and ManagedConfiguration supervision. " +
+                "Apple-recognized supervision needs Configurator or ADE — not a plist edit."
             )
             .font(.subheadline)
             .foregroundStyle(.secondary)
-            Text("EXPERIMENTAL")
-                .font(.caption2.weight(.bold))
-                .tracking(0.8)
-                .foregroundStyle(Theme.caution)
+        }
+    }
+
+    private var placeholder: some View {
+        Text("Running read-only diagnostics…")
+            .font(.subheadline)
+            .foregroundStyle(.secondary)
+            .padding(18)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .liquidGlass()
+    }
+
+    private var statusCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            SectionHeader("Status")
+            VStack(spacing: 0) {
+                statusRow("Filesystem access", diagnostic.last.filesystemAccessStatus)
+                Divider().padding(.leading, 16)
+                statusRow("Configuration integrity", diagnostic.last.integrityStatus,
+                          detail: diagnostic.last.configurationIntegrityDetail)
+                Divider().padding(.leading, 16)
+                statusRow("Supervision eligibility", diagnostic.last.supervisionEligibilityStatus)
+                Divider().padding(.leading, 16)
+                statusRow("Supervision (MC)", diagnostic.last.supervisionStatus,
+                          detail: diagnostic.last.mcProbeError,
+                          emphasize: diagnostic.last.mcIsSupervised == true)
+                Divider().padding(.leading, 16)
+                statusRow("DelayOTA readiness", diagnostic.last.delayOTAStatus)
+            }
+            .padding(.horizontal, 16)
+            .liquidGlass()
+
+            if let verdict = diagnostic.last.restrictionVerdict {
+                Text(verdict)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
+        }
+    }
+
+    private var supervisionWorkflow: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            SectionHeader("Enable Supervision")
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Apple Configurator (supported)")
+                    .font(.body.weight(.semibold))
+                Text(
+                    "1. Back up this iPhone.\n" +
+                    "2. On a Mac: Apple Configurator → select device → Prepare → Supervise.\n" +
+                    "3. This erases the device. Restore from backup afterward if needed.\n" +
+                    "4. Enroll Mareades MDM (or other) if you need DelayOTA deferral.\n" +
+                    "5. Return here → Verify Supervision (MC must show Supervised)."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+                Button { showConfiguratorConfirm = true } label: {
+                    HStack {
+                        Image(systemName: "laptopcomputer.and.iphone")
+                        Text("Continue with Apple Configurator")
+                            .fontWeight(.semibold)
+                        Spacer()
+                    }
+                    .padding(18)
+                    .liquidGlass()
+                }
+                .buttonStyle(.plain)
+                .disabled(diagnostic.isBusy)
+            }
+        }
+    }
+
+    private var verifyButton: some View {
+        Button {
+            busyMessage = "Verifying supervision"
+            Task { await diagnostic.verifySupervisionStatus() }
+        } label: {
+            HStack {
+                Image(systemName: "checkmark.shield")
+                    .foregroundStyle(Theme.accent)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Verify Supervision").font(.body.weight(.semibold))
+                    Text("Re-read ManagedConfiguration isSupervised")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+            .padding(18)
+            .liquidGlass()
+        }
+        .buttonStyle(.plain)
+        .disabled(diagnostic.isBusy)
+    }
+
+    private var diagnosticsDisclosure: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Button {
+                withAnimation { showDiagnostics.toggle() }
+            } label: {
+                HStack {
+                    Text("Diagnostic log")
+                        .font(.subheadline.weight(.semibold))
+                    Spacer()
+                    Image(systemName: showDiagnostics ? "chevron.up" : "chevron.down")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .buttonStyle(.plain)
+
+            if showDiagnostics {
+                VStack(alignment: .leading, spacing: 8) {
+                    if let sha = diagnostic.last.cloudConfigSHA256 {
+                        Text("SHA-256: \(sha)")
+                            .font(.caption2.monospaced())
+                            .textSelection(.enabled)
+                    }
+                    if let sha2 = diagnostic.last.cloudConfigSHA256Recheck {
+                        Text("SHA-256 recheck: \(sha2)")
+                            .font(.caption2.monospaced())
+                            .textSelection(.enabled)
+                    }
+                    Text(diagnostic.last.fsOperationLog.joined(separator: "\n"))
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                }
+                .padding(14)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .liquidGlass()
+            }
         }
     }
 
     private var runButton: some View {
         ActionButton(
-            title: diagnostic.last.ranAt == nil ? "Run diagnostics" : "Re-run diagnostics",
+            title: "Re-run diagnostics",
             systemImage: "stethoscope",
             isBusy: diagnostic.isBusy
         ) {
@@ -100,258 +212,22 @@ struct DeviceManagementView: View {
         }
     }
 
-    private var placeholder: some View {
-        Text("Diagnostics run automatically when this screen opens…")
-            .font(.subheadline)
-            .foregroundStyle(.secondary)
-            .padding(18)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .liquidGlass()
-    }
-
-    private var summaryCard: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Summary").font(.subheadline.weight(.semibold))
-            Text(diagnostic.last.summaryLine)
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-            if let outcome = diagnostic.lastAction {
-                Text(outcome.message)
-                    .font(.caption)
-                    .foregroundStyle(outcome.isSuccess ? Theme.affirmative : Theme.caution)
-            }
-            if let when = diagnostic.last.ranAt {
-                Text(when.formatted(date: .abbreviated, time: .shortened))
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-            }
-        }
-        .padding(18)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .liquidGlass()
-    }
-
-    private var results: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            SectionHeader("Probe results")
-            VStack(spacing: 0) {
-                row("BadQuery available", bool: diagnostic.last.badQueryAvailable)
-                Divider().padding(.leading, 16)
-                row("iOS major", text: "\(diagnostic.last.osMajor)")
-                Divider().padding(.leading, 16)
-                row(
-                    "configurationprofiles dir",
-                    bool: diagnostic.last.configProfilesDirReachable,
-                    detail: diagnostic.last.configProfilesDirError
-                )
-                Divider().padding(.leading, 16)
-                row(
-                    "Directory write (probe file)",
-                    bool: diagnostic.last.dirWriteAllowed,
-                    detail: diagnostic.last.dirWriteError
-                )
-                Divider().padding(.leading, 16)
-                row("CloudConfiguration exists", bool: diagnostic.last.cloudConfigExists)
-                Divider().padding(.leading, 16)
-                row(
-                    "CloudConfiguration readable",
-                    bool: diagnostic.last.cloudConfigReadable,
-                    detail: diagnostic.last.cloudConfigError
-                )
-                Divider().padding(.leading, 16)
-                row(
-                    "CloudConfiguration file info",
-                    text: diagnostic.last.cloudConfigFileInfo != nil ? "see detail" : "—",
-                    detail: diagnostic.last.cloudConfigFileInfo
-                )
-                Divider().padding(.leading, 16)
-                row(
-                    "Failing FS operation",
-                    text: diagnostic.last.failingOperation != nil ? "see detail" : "—",
-                    detail: diagnostic.last.failingOperation
-                )
-                Divider().padding(.leading, 16)
-                row(
-                    "Restriction verdict",
-                    text: diagnostic.last.restrictionVerdict != nil ? "see detail" : "—",
-                    detail: diagnostic.last.restrictionVerdict
-                )
-                Divider().padding(.leading, 16)
-                row(
-                    "FS operation log",
-                    text: diagnostic.last.fsOperationLog.isEmpty ? "—" : "\(diagnostic.last.fsOperationLog.count) ops",
-                    detail: diagnostic.last.fsOperationLog.isEmpty
-                        ? nil
-                        : diagnostic.last.fsOperationLog.joined(separator: "\n")
-                )
-                Divider().padding(.leading, 16)
-                row(
-                    "CloudConfiguration write proven",
-                    bool: diagnostic.last.cloudConfigWriteAllowed,
-                    detail: writeDetail
-                )
-                Divider().padding(.leading, 16)
-                row(
-                    "IsSupervised (plist claim)",
-                    text: plistClaimText,
-                    detail: "Not counted as success alone"
-                )
-                Divider().padding(.leading, 16)
-                row("OrganizationName", text: diagnostic.last.organizationName ?? "—")
-                Divider().padding(.leading, 16)
-                row(
-                    "MC isSupervised (independent)",
-                    text: mcText,
-                    detail: diagnostic.last.mcProbeError
-                )
-                Divider().padding(.leading, 16)
-                row(
-                    "Write gate (Enable eligible)",
-                    bool: diagnostic.last.writeGatePassed
-                )
-                Divider().padding(.leading, 16)
-                row("Local backup present", bool: diagnostic.hasLocalBackup)
-            }
-            .padding(.horizontal, 16)
-            .liquidGlass()
-        }
-    }
-
-    private var writeDetail: String? {
-        if diagnostic.last.cloudConfigWriteAllowed {
-            return "method: \(diagnostic.last.cloudConfigWriteMethod ?? "?")"
-        }
-        if let err = diagnostic.last.cloudConfigWriteError, !err.isEmpty {
-            return err
-        }
-        return nil
-    }
-
-    private var actions: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            SectionHeader("Experimental actions")
-
-            if diagnostic.enableGatePassed {
-                Button { showEnableConfirm = true } label: {
-                    actionCard(
-                        title: "Enable Supervision",
-                        detail: "Write IsSupervised + minimal cloud-config keys; verify via MC",
-                        symbol: "lock.open",
-                        locked: false
-                    )
-                }
-                .buttonStyle(.plain)
-                .disabled(diagnostic.isBusy)
-            } else {
-                actionCard(
-                    title: "Enable Supervision",
-                    detail: lockedEnableDetail,
-                    symbol: "lock.fill",
-                    locked: true
-                )
-            }
-
-            Button {
-                busyMessage = "Verifying"
-                Task { await diagnostic.run() }
-            } label: {
-                actionCard(
-                    title: "Verify Supervision Status",
-                    detail: "Re-run diagnostics + ManagedConfiguration probe",
-                    symbol: "checkmark.shield",
-                    locked: false
-                )
-            }
-            .buttonStyle(.plain)
-            .disabled(diagnostic.isBusy)
-
-            if diagnostic.hasLocalBackup {
-                Button { showRestoreConfirm = true } label: {
-                    actionCard(
-                        title: "Restore Original Configuration",
-                        detail: "Restore CloudConfigurationDetails from app backup",
-                        symbol: "arrow.uturn.backward",
-                        locked: false
-                    )
-                }
-                .buttonStyle(.plain)
-                .disabled(diagnostic.isBusy)
-            } else {
-                actionCard(
-                    title: "Restore Original Configuration",
-                    detail: "No backup yet — created on first Enable",
-                    symbol: "lock.fill",
-                    locked: true
-                )
-            }
-        }
-    }
-
-    private var lockedEnableDetail: String {
-        if let err = diagnostic.last.cloudConfigWriteError, !err.isEmpty {
-            return "Locked — \(err)"
-        }
-        return "Locked until a CloudConfiguration write strategy succeeds"
-    }
-
-    private var delayOTANote: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            SectionHeader("Proof layers")
-            Text(
-                "1) open O_WRONLY under token ≠ 2) persist bytes ≠ 3) MC isSupervised ≠ 4) DelayOTA. " +
-                "Layer 4 still needs Mareades deferral profile + Apple serving 27.0.1."
-            )
-            .font(.caption)
-            .foregroundStyle(.secondary)
-        }
-    }
-
-    // MARK: - Actions
-
-    private func runEnable() async {
-        busyMessage = "Enabling supervision"
-        let outcome = await diagnostic.enableSupervision()
-        actionAlertTitle = outcome.isSuccess ? "Supervision active (MC)" : "Result"
-        actionAlertBody = outcome.message
-        showActionAlert = true
-    }
-
-    private func runRestore() async {
-        busyMessage = "Restoring"
-        let outcome = await diagnostic.restoreOriginalConfiguration()
-        actionAlertTitle = outcome.isSuccess ? "Restored" : "Restore failed"
-        actionAlertBody = outcome.message
-        showActionAlert = true
-    }
-
     // MARK: - Rows
 
-    private var plistClaimText: String {
-        guard diagnostic.last.cloudConfigReadable else { return "—" }
-        guard let v = diagnostic.last.isSupervisedPlistClaim else { return "key absent" }
-        return v ? "true" : "false"
-    }
-
-    private var mcText: String {
-        if let v = diagnostic.last.mcIsSupervised { return v ? "true" : "false" }
-        if diagnostic.last.mcProbeAttempted {
-            return diagnostic.last.mcProbeSupported ? "—" : "unsupported"
-        }
-        return "not run"
-    }
-
-    private func row(_ title: String, bool: Bool, detail: String? = nil) -> some View {
-        row(title, text: bool ? "yes" : "no", detail: detail, affirmative: bool)
-    }
-
-    private func row(_ title: String, text: String, detail: String? = nil, affirmative: Bool? = nil) -> some View {
+    private func statusRow(
+        _ title: String,
+        _ value: String,
+        detail: String? = nil,
+        emphasize: Bool = false
+    ) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(alignment: .firstTextBaseline) {
                 Text(title).font(.subheadline.weight(.medium))
                 Spacer()
-                Text(text)
+                Text(value)
                     .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(color(for: affirmative, text: text))
+                    .foregroundStyle(emphasize ? Theme.affirmative : .primary)
+                    .multilineTextAlignment(.trailing)
             }
             if let detail, !detail.isEmpty {
                 Text(detail)
@@ -361,27 +237,5 @@ struct DeviceManagementView: View {
             }
         }
         .padding(.vertical, 12)
-    }
-
-    private func color(for affirmative: Bool?, text: String) -> Color {
-        if let affirmative { return affirmative ? Theme.affirmative : .secondary }
-        if text == "true" || text == "yes" { return Theme.affirmative }
-        return .primary
-    }
-
-    private func actionCard(title: String, detail: String, symbol: String, locked: Bool) -> some View {
-        HStack(spacing: 12) {
-            Image(systemName: symbol)
-                .foregroundStyle(locked ? .secondary : Theme.accent)
-                .frame(width: 24)
-            VStack(alignment: .leading, spacing: 3) {
-                Text(title).font(.body.weight(.semibold)).foregroundStyle(.primary)
-                Text(detail).font(.caption).foregroundStyle(.secondary)
-            }
-            Spacer()
-        }
-        .padding(18)
-        .liquidGlass()
-        .opacity(locked ? 0.72 : 1)
     }
 }

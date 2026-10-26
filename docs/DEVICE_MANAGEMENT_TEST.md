@@ -1,41 +1,13 @@
-# Device Management — on-device tests (iOS 27 beta 3)
+# Device Management
 
-## Build / IPA
+## Integrity false-negative (fixed in 1.4.0)
 
-GitHub Actions on `Ventspew/Ketamine` builds `Ketamine-unsigned.ipa` (artifact `Ketamine-unsigned-ipa`).
+Prior builds could report **INTEGRITY FAIL** after a successful identical persist because a later read without a live BadQuery token failed / disagreed, then cleared `writeProven`. Diagnostics are now **read-only** on the live plist and compare **SHA-256** across two token-held reads. Recheck failure ≠ corruption.
 
-## What this build does
+## Genuine supervision
 
-Opening **Device Management** auto-runs non-destructive probes, including six CloudConfiguration write strategies:
+KetaMine does **not** rewrite `IsSupervised` in CloudConfigurationDetails to claim supervision.
 
-1. inplace + SystemGroup dir token  
-2. inplace + parent dir token  
-3. inplace + file token  
-4. POSIX `O_WRONLY|O_TRUNC`  
-5. temp + `replaceItem`  
-6. unlink + recreate  
+Supported path: **Apple Configurator → Prepare → Supervise** (erases device), then optional MDM, then **Verify Supervision** (ManagedConfiguration `isSupervised`).
 
-Enable unlocks only if **at least one** strategy can rewrite the plist. Directory write alone is not enough.
-
-## Test A — Write capability
-
-1. Install IPA → **System Hub → Device Management** (auto diagnostics).
-2. Note:
-   - Directory write = yes/no  
-   - CloudConfiguration file info (mode/uid/flags/access)  
-   - CloudConfiguration write = yes + **method**, or the full per-strategy error string  
-3. Paste the write detail / file info if Enable stays locked.
-
-## Test B — Enable Supervision (only if write gate = yes)
-
-1. Confirm dialog → Enable.  
-2. Success **only** if MC `isSupervised = true`.  
-3. Plist-only change = incomplete — not DelayOTA-ready.
-
-## Test C — Restore
-
-Use **Restore Original Configuration** if a backup exists.
-
-## Test D — DelayOTA
-
-Only if MC = true + Mareades deferral profile installed. Else: **unknown**.
+DelayOTA additionally needs a deferral MDM profile and a still-signed target build.
